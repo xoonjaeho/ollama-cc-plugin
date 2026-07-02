@@ -1,0 +1,21 @@
+{
+  "name": "ollama-cc",
+  "owner": {
+    "name": "xoonjaeho"
+  },
+  "metadata": {
+    "description": "Use local/cloud ollama models from Claude Code: read-only review/consult plus an agentic worktree-isolated rescue.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "ollama",
+      "description": "Use ollama models as a second engine: read-only consult/review, plus an agentic rescue that edits files in an isolated git worktree for you to review.",
+      "version": "0.2.0",
+      "author": {
+        "name": "xoonjaeho"
+      },
+      "source": "./plugins/ollama"
+    }
+  ]
+}
