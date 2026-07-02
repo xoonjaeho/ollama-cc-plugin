@@ -38,17 +38,27 @@ import time
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
 from ollama_companion import _post, DEFAULT_MODEL  # noqa: E402
 
+
+def _int_env(name, default):
+    """int() an env var, falling back to default on unset or unparseable value."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
 READ_CAP = 16 * 1024          # bytes returned to the model per read/tool result
+WRITE_CAP = 1024 * 1024       # 1 MiB per write_file: ample for source, caps a runaway model from filling the worktree disk before review
 EGRESS_BUDGET = 8 * 1024 * 1024
 MAX_ITERS = 15
 TIMEOUT_TOTAL = 300           # seconds, whole run
 TOOL_CALL_CAP = 40
 MALFORMED_CAP = 3
 LOOP_REPEAT_CAP = 3           # identical non-write call N times -> loop
-NUM_CTX = 32768               # sent as options.num_ctx so the SERVER context covers our client budget
-# ponytail: char proxy for ~NUM_CTX tokens at ~3 chars/token, kept well under so the
+NUM_CTX = _int_env("OLLAMA_CC_NUM_CTX", 32768)   # options.num_ctx; default assumes a >=32k model. Lower via OLLAMA_CC_NUM_CTX for a small local model.
+# ponytail: char proxy for the token budget at ~2.75 chars/token, kept under NUM_CTX so the
 # server never front-truncates our pinned system+task (client _truncate_history does it first).
-CTX_CHAR_BUDGET = 90_000
+CTX_CHAR_BUDGET = int(NUM_CTX * 2.75)
 
 
 class JailError(Exception):
@@ -115,10 +125,13 @@ def tool_write_file(root_real, args):
     content = args.get("content")
     if content is None:
         raise JailError("write_file requires 'content'")
+    nbytes = len(content.encode("utf-8"))
+    if nbytes > WRITE_CAP:                    # bound each write so a runaway model can't fill the disk pre-review
+        raise JailError("write_file content too large: %d bytes (cap %d)" % (nbytes, WRITE_CAP))
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8", newline="") as f:
         f.write(content)
-    return "wrote %d bytes to %s" % (len(content.encode("utf-8")), rel)
+    return "wrote %d bytes to %s" % (nbytes, rel)
 
 
 def tool_list_dir(root_real, args):

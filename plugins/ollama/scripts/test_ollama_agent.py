@@ -129,6 +129,12 @@ class LoopTest(unittest.TestCase):
         with open(os.path.join(self.d, "out.txt")) as f:
             self.assertEqual(f.read(), "X")
 
+    def test_write_file_rejects_oversize(self):
+        big = "A" * (oa.WRITE_CAP + 1)
+        with self.assertRaises(oa.JailError):
+            oa.tool_write_file(self.d, {"path": "big.txt", "content": big})
+        self.assertFalse(os.path.exists(os.path.join(self.d, "big.txt")))  # nothing written
+
     def test_jail_failure_becomes_error_result_not_crash(self):
         seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "../secret"})]),
                         _asst(content="ok")])
@@ -224,6 +230,20 @@ class TruncateTest(unittest.TestCase):
                 self.assertEqual(msgs[2]["role"], "assistant")
         finally:
             oa.CTX_CHAR_BUDGET = old
+
+
+class EnvKnobTest(unittest.TestCase):
+    def test_int_env_parses_and_falls_back(self):
+        name = "OLLAMA_CC_NUM_CTX_TESTONLY"
+        os.environ.pop(name, None)
+        self.assertEqual(oa._int_env(name, 32768), 32768)        # unset -> default
+        os.environ[name] = "8192"
+        try:
+            self.assertEqual(oa._int_env(name, 32768), 8192)     # parsed
+            os.environ[name] = "not-an-int"
+            self.assertEqual(oa._int_env(name, 32768), 32768)    # unparseable -> default, no crash
+        finally:
+            os.environ.pop(name, None)
 
 
 def _init_repo():

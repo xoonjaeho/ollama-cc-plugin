@@ -59,6 +59,7 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 |---|---|---|
 | `OLLAMA_CC_MODEL` | `glm-5.2:cloud` | Default model for the commands |
 | `OLLAMA_CC_HOST` | `http://127.0.0.1:11434` | ollama daemon base URL. Falls back to ollama's own `OLLAMA_HOST` (bare `host:port` accepted) when unset. |
+| `OLLAMA_CC_NUM_CTX` | `32768` | Context window sent to the agentic rescue (`options.num_ctx`); the client-side char budget is derived from it. Lower it for a small-context local model so the agent's pinned system+task aren't front-truncated. |
 
 ## Relationship to `/octo:debate`
 

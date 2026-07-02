@@ -20,6 +20,7 @@ import urllib.request
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_CC_MODEL", "glm-5.2:cloud")
 TIMEOUT = 120  # ponytail: fixed 120s; --timeout overrides for huge-diff reviews
+PROMPT_WARN_CHARS = 100_000  # ~30k tokens; warn (never block) so an oversized diff can't silently overflow a ~32k-ctx model
 
 
 def _resolve_host():
@@ -152,6 +153,10 @@ def cmd_run(args):
     if not raw.strip():
         print("error: empty prompt (pass as an argument or via stdin).", file=sys.stderr)
         return 2
+    if len(raw) > PROMPT_WARN_CHARS:
+        print("warning: prompt is %d chars (~%dk tokens); may exceed the model's context and be "
+              "silently truncated. Narrow the scope (e.g. --base, fewer files)."
+              % (len(raw), len(raw) // 3000), file=sys.stderr)
     payload = {
         "model": model,
         # unstripped: preserve significant whitespace in a piped diff

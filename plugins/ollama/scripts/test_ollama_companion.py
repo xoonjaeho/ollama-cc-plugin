@@ -79,6 +79,14 @@ class TestRun(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue().strip(), "pong")
 
+    def test_oversized_prompt_warns_but_proceeds(self):
+        oc._post = lambda *a, **k: {"message": {"content": "ok"}}
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = oc.cmd_run(_Args(prompt="x" * (oc.PROMPT_WARN_CHARS + 1)))
+        self.assertEqual(rc, 0)                       # warning must not block the call
+        self.assertIn("may exceed", err.getvalue())
+
     def test_error_in_200_body_is_not_success(self):
         oc._post = lambda *a, **k: {"error": "model failed to load"}
         err = io.StringIO()
