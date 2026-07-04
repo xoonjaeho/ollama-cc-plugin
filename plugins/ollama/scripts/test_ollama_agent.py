@@ -29,6 +29,28 @@ def _call(name, args, cid="c1"):
     return {"id": cid, "function": {"name": name, "arguments": args}}
 
 
+def _no_orphan(messages):
+    """True iff no assistant turn is followed by fewer role:tool results than it has
+    tool_calls (before the next assistant / the synth instruction). Catches the
+    loop_detected mid-turn orphan the fallback must strip."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            need = len(m["tool_calls"])
+            have = 0
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                have += 1
+                j += 1
+            if have < need:
+                return False
+            i = j
+        else:
+            i += 1
+    return True
+
+
 class _SeqPost:
     """Returns queued responses in order; records the payloads it was sent."""
     def __init__(self, responses):
@@ -303,11 +325,46 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual([m["role"] for m in out], ["system", "user"])
 
     def test_strip_keeps_complete_trailing_turn(self):
+        asst = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]}
+        tool = {"role": "tool", "content": "r"}
         msgs = [{"role": "system", "content": "s"},
                 {"role": "user", "content": "t"},
-                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
-                {"role": "tool", "content": "r"}]
-        self.assertEqual(len(oa._strip_incomplete_trailing_turn(msgs)), 4)
+                asst, tool]
+        out = oa._strip_incomplete_trailing_turn(msgs)
+        self.assertEqual(len(out), 4)            # nothing dropped
+        self.assertIs(out[2], asst)             # the assistant turn is actually kept
+        self.assertIs(out[3], tool)
+
+    def test_strip_drops_partial_midturn_orphan(self):
+        # loop_detected tripping on tc_k of N leaves last==tool with k<N results:
+        # the helper must walk back through the trailing tool to the orphan assistant.
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "t"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}, {"id": "c2"}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "error: loop guard"}]
+        out = oa._strip_incomplete_trailing_turn(msgs)
+        self.assertEqual([m["role"] for m in out], ["system", "user"])  # orphan turn + partial result gone
+
+    def test_fallback_salvages_loop_detected_multi_call_turn(self):
+        # the guard trips on the FIRST tool_call of a 2-call turn, leaving 1 result
+        # for 2 tool_calls. _strip must drop that orphan turn so the no-tools salvage
+        # call doesn't ship an invalid conversation ollama would reject.
+        for n in ("same.txt", "other.txt"):
+            with open(os.path.join(self.d, n), "w") as f:
+                f.write(n)
+        seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "same.txt"}, "a1")]),
+                        _asst(tool_calls=[_call("read_file", {"path": "same.txt"}, "a2")]),
+                        _asst(tool_calls=[_call("read_file", {"path": "same.txt"}, "a3"),
+                                          _call("read_file", {"path": "other.txt"}, "a4")]),
+                        _asst(content="salvaged multi-call")])
+        oa._post = seq
+        r = oa.run_agent("repeat multi", self.d, max_iters=10)
+        self.assertEqual(r["stop_reason"], "loop_detected")
+        self.assertIn("salvaged", r["final"])
+        # the fallback payload must carry no orphan assistant turn (every assistant's
+        # tool_calls matched by its trailing role:tool results). Pre-fix this failed:
+        # 2 tool_calls / 1 result -> ollama reject -> final "".
+        self.assertTrue(_no_orphan(seq.payloads[-1]["messages"]))
 
 
 class TruncateTest(unittest.TestCase):

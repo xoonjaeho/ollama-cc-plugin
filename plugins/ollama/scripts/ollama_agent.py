@@ -279,9 +279,14 @@ _GREP_TOOL = {"type": "function", "function": {
                    "required": ["pattern"]}}}
 
 
+_READ_ONLY_TOOLS = (_READ_TOOL, _LIST_TOOL, _GREP_TOOL)
+# single source of truth for the always-present read tools: _toolset's tool list
+# and the readonly loop-guard exemption (_IDEMPOTENT_READS) both derive from this.
+
+
 def _toolset(allow_write=True, allow_shell=False):
     # read tools (incl. the list/grep egress-reducers) are always available
-    tools = [_READ_TOOL, _LIST_TOOL, _GREP_TOOL]
+    tools = list(_READ_ONLY_TOOLS)
     dispatch = {"read_file": tool_read_file, "list_dir": tool_list_dir, "grep_search": tool_grep_search}
     if allow_write:
         tools.append(_WRITE_TOOL)
@@ -309,7 +314,10 @@ def _truncate_history(messages, pinned):
 
 
 # Bounded stops where a forced no-tools synthesis call can salvage the work already
-# in context. timeout/egress_budget are excluded: no budget left to make the call.
+# in context. timeout/egress_budget are excluded: timeout leaves no time to make the
+# call, and egress_budget must hold -- spending past the cap to salvage would defeat
+# it. So a readonly runaway that hits egress/timeout before max_iters still returns
+# empty; the readonly rescue only salvages when an iter/call cap binds first.
 # api_error/malformed are excluded: the model is unreachable or producing junk.
 _SYNTH_STOPS = {"loop_detected", "max_iters", "tool_call_cap"}
 _SYNTH_INSTRUCTION = ("Stop calling tools. Using only the information already in "
@@ -317,28 +325,40 @@ _SYNTH_INSTRUCTION = ("Stop calling tools. Using only the information already in
 # readonly, side-effect-free reads: exempt from the hard loop abort so a readonly
 # task isn't killed for a re-read. MAX_ITERS / TOOL_CALL_CAP / egress / timeout +
 # the forced-synthesis fallback remain as runaway backstops.
-_IDEMPOTENT_READS = ("read_file", "list_dir", "grep_search")
+_IDEMPOTENT_READS = tuple(t["function"]["name"] for t in _READ_ONLY_TOOLS)
+
+
+def _chat_payload(model, messages, tools, think, num_ctx):
+    """Build the /api/chat request body. Shared by the main loop and the fallback so
+    the payload schema can't drift between them."""
+    return {"model": model, "messages": messages, "tools": tools,
+            "stream": False, "think": bool(think),
+            "options": {"temperature": 0.2, "num_ctx": num_ctx}}
 
 
 def _strip_incomplete_trailing_turn(messages):
     """Return a copy of messages with a trailing assistant turn whose tool_calls
-    lack matching tool results removed. A bounded stop can leave such an orphan
-    (tool_call_cap aborts a turn before any result is appended); feeding it to a
-    no-tools /api/chat makes ollama reject 'expected a tool result'."""
+    lack matching tool results removed. A bounded stop can leave such an orphan two
+    ways: tool_call_cap aborts before any result is appended (last == assistant, 0
+    results); loop_detected trips mid-turn on tc_k of N and appends only k results
+    (last == tool, k < N). Feeding an orphan to a no-tools /api/chat makes ollama
+    reject 'expected a tool result'."""
     if not messages:
         return list(messages)
-    last = messages[-1]
-    if last.get("role") != "assistant" or not last.get("tool_calls"):
-        return list(messages)
-    needed = len(last["tool_calls"])
+    # walk back through the trailing run of role:tool results to its anchor assistant.
     have = 0
     i = len(messages) - 1
-    while i > 0 and messages[i].get("role") == "tool":
+    while i >= 0 and messages[i].get("role") == "tool":
         have += 1
         i -= 1
-    if have >= needed:
+    if i < 0:
         return list(messages)
-    # i now points at the trailing assistant turn; drop it and any partial results.
+    last = messages[i]
+    if last.get("role") != "assistant" or not last.get("tool_calls"):
+        return list(messages)
+    if have >= len(last["tool_calls"]):
+        return list(messages)
+    # drop the incomplete assistant turn and any partial results after it.
     return list(messages[:i])
 
 
@@ -349,20 +369,21 @@ def _force_synthesis(messages, model, think, num_ctx, remaining_timeout, remaini
     if remaining_timeout < 1 or remaining_egress <= 0:
         return "", 0
     msgs = _strip_incomplete_trailing_turn(messages)
-    payload = {"model": model,
-               "messages": msgs + [{"role": "user", "content": _SYNTH_INSTRUCTION}],
-               "tools": [], "stream": False, "think": bool(think),
-               "options": {"temperature": 0.2, "num_ctx": num_ctx}}
+    payload = _chat_payload(model, msgs + [{"role": "user", "content": _SYNTH_INSTRUCTION}],
+                            [], think, num_ctx)
     projected = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     if projected > remaining_egress:
         return "", 0
+    # charge on attempt, matching the main loop (which adds `projected` before _post).
     try:
         data = _post("/api/chat", payload, timeout=max(1, int(remaining_timeout)))
     except Exception:  # noqa: BLE001 - fallback must never crash the run
-        return "", 0
+        return "", projected
     if not isinstance(data, dict) or data.get("error"):
-        return "", 0
-    return (data.get("message") or {}).get("content", "") or "", projected
+        return "", projected
+    msg = data.get("message")
+    content = msg.get("content", "") if isinstance(msg, dict) else ""
+    return content or "", projected
 
 
 # ---------------------------------------------------------------- the loop
@@ -402,6 +423,10 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
     def stop(reason, final=""):
         nonlocal egress_bytes
         if not final and reason in _SYNTH_STOPS:
+            # trim to budget first: max_iters bails before _truncate_history, so the
+            # in-context messages can be one turn over budget; without this ollama
+            # front-truncates the pinned system+task (the context salvage needs).
+            _truncate_history(messages, pinned)
             final, spent = _force_synthesis(
                 messages, model, think, NUM_CTX,
                 timeout_total - (time.monotonic() - start),
@@ -419,9 +444,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
         if elapsed > timeout_total:
             return stop("timeout")
         _truncate_history(messages, pinned)
-        payload = {"model": model, "messages": messages, "tools": tools,
-                   "stream": False, "think": bool(think),
-                   "options": {"temperature": 0.2, "num_ctx": NUM_CTX}}
+        payload = _chat_payload(model, messages, tools, think, NUM_CTX)
         projected = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         if egress_bytes + projected > EGRESS_BUDGET:   # check BEFORE it leaves the process
             return stop("egress_budget")
