@@ -308,6 +308,63 @@ def _truncate_history(messages, pinned):
     return messages
 
 
+# Bounded stops where a forced no-tools synthesis call can salvage the work already
+# in context. timeout/egress_budget are excluded: no budget left to make the call.
+# api_error/malformed are excluded: the model is unreachable or producing junk.
+_SYNTH_STOPS = {"loop_detected", "max_iters", "tool_call_cap"}
+_SYNTH_INSTRUCTION = ("Stop calling tools. Using only the information already in "
+                      "context, produce the final answer now.")
+# readonly, side-effect-free reads: exempt from the hard loop abort so a readonly
+# task isn't killed for a re-read. MAX_ITERS / TOOL_CALL_CAP / egress / timeout +
+# the forced-synthesis fallback remain as runaway backstops.
+_IDEMPOTENT_READS = ("read_file", "list_dir", "grep_search")
+
+
+def _strip_incomplete_trailing_turn(messages):
+    """Return a copy of messages with a trailing assistant turn whose tool_calls
+    lack matching tool results removed. A bounded stop can leave such an orphan
+    (tool_call_cap aborts a turn before any result is appended); feeding it to a
+    no-tools /api/chat makes ollama reject 'expected a tool result'."""
+    if not messages:
+        return list(messages)
+    last = messages[-1]
+    if last.get("role") != "assistant" or not last.get("tool_calls"):
+        return list(messages)
+    needed = len(last["tool_calls"])
+    have = 0
+    i = len(messages) - 1
+    while i > 0 and messages[i].get("role") == "tool":
+        have += 1
+        i -= 1
+    if have >= needed:
+        return list(messages)
+    # i now points at the trailing assistant turn; drop it and any partial results.
+    return list(messages[:i])
+
+
+def _force_synthesis(messages, model, think, num_ctx, remaining_timeout, remaining_egress):
+    """One no-tools /api/chat to salvage a final answer from context on a bounded
+    stop. Returns (content, egress_spent). Degrades to ("", 0) when out of budget,
+    the call fails, or the model returns empty -- never raises."""
+    if remaining_timeout < 1 or remaining_egress <= 0:
+        return "", 0
+    msgs = _strip_incomplete_trailing_turn(messages)
+    payload = {"model": model,
+               "messages": msgs + [{"role": "user", "content": _SYNTH_INSTRUCTION}],
+               "tools": [], "stream": False, "think": bool(think),
+               "options": {"temperature": 0.2, "num_ctx": num_ctx}}
+    projected = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if projected > remaining_egress:
+        return "", 0
+    try:
+        data = _post("/api/chat", payload, timeout=max(1, int(remaining_timeout)))
+    except Exception:  # noqa: BLE001 - fallback must never crash the run
+        return "", 0
+    if not isinstance(data, dict) or data.get("error"):
+        return "", 0
+    return (data.get("message") or {}).get("content", "") or "", projected
+
+
 # ---------------------------------------------------------------- the loop
 def _system_prompt(root):
     return (
@@ -343,6 +400,13 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
     start = time.monotonic()
 
     def stop(reason, final=""):
+        nonlocal egress_bytes
+        if not final and reason in _SYNTH_STOPS:
+            final, spent = _force_synthesis(
+                messages, model, think, NUM_CTX,
+                timeout_total - (time.monotonic() - start),
+                EGRESS_BUDGET - egress_bytes)
+            egress_bytes += spent
         return {"stop_reason": reason, "iterations": iters, "final": final,
                 "actions": actions, "egress_bytes": egress_bytes,
                 "tool_calls": tool_calls_total, "model": model}
@@ -413,7 +477,11 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             key = (name, json.dumps(key_args, sort_keys=True, ensure_ascii=False))
             is_reread_after_write = (name == "read_file" and canon is not None and canon in written)
             seen[key] = seen.get(key, 0) + 1
-            if seen[key] >= LOOP_REPEAT_CAP and name != "write_file" and not is_reread_after_write:
+            readonly_idempotent = (not allow_write and name in _IDEMPOTENT_READS)
+            if (seen[key] >= LOOP_REPEAT_CAP
+                    and name != "write_file"
+                    and not is_reread_after_write
+                    and not readonly_idempotent):
                 _append_tool(messages, tool_call_id, name, "error: repeated identical call (loop guard)")
                 return stop("loop_detected")
             try:

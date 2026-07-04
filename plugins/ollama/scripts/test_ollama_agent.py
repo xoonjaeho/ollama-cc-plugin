@@ -211,6 +211,105 @@ class LoopTest(unittest.TestCase):
         self.assertTrue(rest.startswith("A"))
 
 
+class FallbackTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = oa._post
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        oa._post = self._orig
+
+    def test_fallback_salvages_loop_detected(self):
+        # allow_write=True (default) so the loop guard still trips on the 3rd
+        # identical read; the forced-synthesis call must then salvage a final.
+        with open(os.path.join(self.d, "same.txt"), "w") as f:
+            f.write("DATA")
+        seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "same.txt"})])] * 3
+                       + [_asst(content="synthesized from same.txt")])
+        oa._post = seq
+        r = oa.run_agent("repeat read", self.d, max_iters=10)
+        self.assertEqual(r["stop_reason"], "loop_detected")
+        self.assertIn("synthesized", r["final"])
+        # the synthesis call must offer no tools
+        self.assertEqual(seq.payloads[-1]["tools"], [])
+
+    def test_fallback_salvages_tool_call_cap(self):
+        # aborts mid-turn (assistant turn appended, no tool results) -> the orphan
+        # turn is stripped before the no-tools synthesis call salvages an answer.
+        for n in ("a.txt", "b.txt"):
+            with open(os.path.join(self.d, n), "w") as f:
+                f.write(n)
+        old = oa.TOOL_CALL_CAP
+        oa.TOOL_CALL_CAP = 1
+        try:
+            seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "a.txt"}),
+                                               _call("read_file", {"path": "b.txt"})]),
+                            _asst(content="synthesized from context")])
+            oa._post = seq
+            r = oa.run_agent("read both", self.d, max_iters=10)
+            self.assertEqual(r["stop_reason"], "tool_call_cap")
+            self.assertIn("synthesized", r["final"])
+        finally:
+            oa.TOOL_CALL_CAP = old
+
+    def test_readonly_repeated_read_does_not_hard_abort(self):
+        # readonly idempotent reads are exempt from the loop guard, so the run
+        # reaches a bounded stop (max_iters) and the fallback salvages an answer
+        # instead of discarding it as loop_detected with empty final.
+        with open(os.path.join(self.d, "same.txt"), "w") as f:
+            f.write("X")
+        seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "same.txt"})])] * 4
+                       + [_asst(content="readonly synthesized")])
+        oa._post = seq
+        r = oa.run_agent("repeat readonly", self.d, allow_write=False, max_iters=4)
+        self.assertNotEqual(r["stop_reason"], "loop_detected")
+        self.assertIn("synthesized", r["final"])
+
+    def test_fallback_respects_egress_budget(self):
+        # no egress left -> the call is never made (degrades to ("", 0) without
+        # spending more). Asserts _post is NOT called, so removing the guard fails
+        # the test deterministically rather than relying on a daemon being down.
+        called = []
+        orig = oa._post
+        oa._post = lambda path, payload, timeout=None: called.append(payload) or {"message": {"content": "LEAK"}}
+        try:
+            content, spent = oa._force_synthesis(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}],
+                "m", False, 32768, remaining_timeout=60, remaining_egress=0)
+        finally:
+            oa._post = orig
+        self.assertEqual((content, spent), ("", 0))
+        self.assertEqual(called, [])  # guard prevented the call entirely
+
+    def test_fallback_respects_timeout(self):
+        called = []
+        orig = oa._post
+        oa._post = lambda path, payload, timeout=None: called.append(payload) or {"message": {"content": "LEAK"}}
+        try:
+            content, spent = oa._force_synthesis(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}],
+                "m", False, 32768, remaining_timeout=0, remaining_egress=oa.EGRESS_BUDGET)
+        finally:
+            oa._post = orig
+        self.assertEqual((content, spent), ("", 0))
+        self.assertEqual(called, [])
+
+    def test_strip_drops_orphan_assistant_turn(self):
+        # tool_call_cap shape: 2 tool_calls, 0 results -> assistant turn dropped
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "t"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}, {"id": "c2"}]}]
+        out = oa._strip_incomplete_trailing_turn(msgs)
+        self.assertEqual([m["role"] for m in out], ["system", "user"])
+
+    def test_strip_keeps_complete_trailing_turn(self):
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "t"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+                {"role": "tool", "content": "r"}]
+        self.assertEqual(len(oa._strip_incomplete_trailing_turn(msgs)), 4)
+
+
 class TruncateTest(unittest.TestCase):
     def test_truncate_pins_system_and_task(self):
         old = oa.CTX_CHAR_BUDGET
