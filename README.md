@@ -98,3 +98,7 @@ Self-checks stub the HTTP/daemon layer (no real daemon needed):
 cd plugins/ollama/scripts
 python -m unittest test_ollama_companion test_ollama_agent
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
