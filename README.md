@@ -27,14 +27,26 @@ Two tiers:
 
 ## Install
 
+```bash
+/plugin marketplace add xoonjaeho/ollama-cc-plugin
+/plugin install ollama@ollama-cc
+/reload-plugins
+/ollama:setup
+```
+
+`/ollama:setup` checks the daemon, lists your models, and flags cloud sign-in.
+
+<details>
+<summary>Install from a local clone (development)</summary>
+
 Local marketplaces take a **relative** path (`./…`), not an absolute one:
 
 ```bash
 /plugin marketplace add ./ollama-cc-plugin
 /plugin install ollama@ollama-cc
 /reload-plugins
-/ollama:setup
 ```
+</details>
 
 ## Agentic rescue — safety ⚠️
 
