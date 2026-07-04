@@ -16,6 +16,7 @@ Two tiers:
 | `/ollama:review` | read-only | review your git changes with a model (cloud egress gated) |
 | `/ollama:adversarial-review` | read-only | a model **explores** your repo (read/list/grep) and challenges it; steerable focus |
 | `/ollama:rescue` | **agentic** | delegate a coding task; the model edits files in an isolated worktree → you review the diff before it applies |
+| `/ollama:as-claude` | **full session** | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — full write+shell on your real tree, **no worktree, no diff gate**. More dangerous than rescue |
 
 ## Requirements
 
@@ -52,6 +53,15 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 ```
 
 `--model <name>` overrides the default per command.
+
+## as-claude — safety ⚠️⚠️
+
+`/ollama:as-claude` runs your task inside a **full, real Claude Code session** (`ollama launch claude`) whose brain is an ollama model. It is stronger, and **more dangerous**, than `/ollama:rescue`:
+
+- **No isolation, no diff gate.** The session runs with `--dangerously-skip-permissions` on your **real working tree and host** — it can read, write, delete, and run shell/network commands with no per-action approval and no diff to review. Every run is arbitrary code execution you authorize up front. For edits you want to review before they land, use `/ollama:rescue` instead (worktree-isolated).
+- **Cloud egress + remote control.** With a cloud model, everything the session reads *and does* is exposed to `ollama.com` — a third party driving a full agent on your machine. The command discloses this and asks for consent once before launching.
+- **Continue a session** with `--resume <session-id>` (printed after each run); override the model with `--model <name>`.
+- The `total_cost_usd` the session reports is Claude Code's own placeholder estimate, **not** ollama's billing.
 
 ## Configuration
 
