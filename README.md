@@ -17,6 +17,13 @@ Two tiers:
 | `/ollama:adversarial-review` | read-only | a model **explores** your repo (read/list/grep) and challenges it; steerable focus |
 | `/ollama:rescue` | **agentic** | delegate a coding task; the model edits files in an isolated worktree → you review the diff before it applies |
 | `/ollama:as-claude` | **full session** | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — full write+shell on your real tree, **no worktree, no diff gate**. More dangerous than rescue |
+| `/ollama:list` | read-only | list installed / available models |
+| `/ollama:ps` | read-only | list running (in-memory) models |
+| `/ollama:show` | read-only | show a model's details (family, parameters, quantization, size) |
+| `/ollama:pull` | manage | download/install a model — **confirms before the download** |
+| `/ollama:rm` | manage | delete an installed model — **confirms before deleting** |
+| `/ollama:usage` | read-only | show your ollama.com **cloud usage** (session + weekly %) |
+| `/ollama:usage-login` | setup | capture your ollama.com session via a one-time browser login (optional; needs Playwright) |
 
 ## Requirements
 
@@ -24,6 +31,7 @@ Two tiers:
 - **Python 3.x** on `PATH` (stdlib-only, no packages). On Windows, `py -3` is a fallback if `python` is missing.
 - **git** on `PATH` (the agentic rescue uses `git worktree`).
 - For **cloud models** (any model whose name contains `cloud`, e.g. `glm-5.2:cloud`): sign in once with `ollama signin`.
+- **Optional**, only for `/ollama:usage-login` (browser-based session capture): the `playwright` package (`pip install playwright`) + Google Chrome. The manual `/ollama:usage` setup needs nothing extra.
 
 ## Install
 
@@ -75,6 +83,31 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 - **Continue a session** with `--resume <session-id>` (printed after each run); override the model with `--model <name>`.
 - The `total_cost_usd` the session reports is Claude Code's own placeholder estimate, **not** ollama's billing.
 
+## Model management
+
+`/ollama:list`, `/ollama:ps`, and `/ollama:show` are read-only views of the local daemon. `/ollama:pull` and `/ollama:rm` change state, so they **confirm first**: the command shows what will be downloaded (or the model and disk it frees) and only proceeds after you say yes — the underlying script refuses to mutate without an explicit `--yes`, and `rm` only ever deletes the single model you named. All of these talk only to the local daemon; no extra dependencies.
+
+## Cloud usage (`/ollama:usage`)
+
+Shows how much of your ollama.com cloud allowance you've used (session + weekly %). There is **no usage API** — the numbers live only on the cookie-gated `ollama.com/settings` page — so this reads them by replaying your logged-in browser **session cookie**. The reader validates the response (a real percentage must parse; a login page returning HTTP 200 is never treated as success) and caches the last good result, so a transient network blip never erases your numbers.
+
+### One-time setup
+
+`/ollama:usage` will report "needs login" until you store a session once. Two ways:
+
+- **Manual (no dependency).** `/ollama:usage` walks you through it: in your logged-in Chrome, open `ollama.com/settings`, DevTools → Network → reload → right-click the `settings` request → **Copy as cURL**, and paste it. Only the durable session cookie is extracted and stored.
+- **Browser (optional, needs Playwright + Chrome).** `/ollama:usage-login` opens a real Chrome window; you log in once (solving any CAPTCHA yourself), and it captures the cookie automatically. `--headless` re-captures later without a new login.
+
+### Security
+
+- The stored value is a **live session cookie — treat it like a password.** It is written to `~/.ollama-usage/session` with owner-only permissions (`0600` on Unix; on Windows the file sits in your user profile, which is already user-private — `chmod` there is best-effort).
+- It is **only ever sent to `ollama.com`**, and is never logged or printed back to you.
+- Only the durable `__Secure-session` cookie is kept — not your whole cookie jar.
+
+### When it expires
+
+Sessions don't last forever. When yours ends (logout, or the cookie's own lifetime — on the order of weeks), the reader detects the rejected session and reports **"needs login"**; just re-run the setup above. Everything degrades gracefully — a network hiccup keeps showing your last-known numbers (marked stale) and does **not** nag you to re-login; only a genuinely rejected session does.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -82,6 +115,7 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 | `OLLAMA_CC_MODEL` | `glm-5.2:cloud` | Default model for the commands |
 | `OLLAMA_CC_HOST` | `http://127.0.0.1:11434` | ollama daemon base URL. Falls back to ollama's own `OLLAMA_HOST` (bare `host:port` accepted) when unset. |
 | `OLLAMA_CC_NUM_CTX` | `32768` | Context window sent to the agentic rescue (`options.num_ctx`); the client-side char budget is derived from it. Lower it for a small-context local model so the agent's pinned system+task aren't front-truncated. |
+| `OLLAMA_USAGE_DIR` | `~/.ollama-usage` | Where the cloud-usage session cookie and cache are stored. |
 
 ## Relationship to `/octo:debate`
 
@@ -89,14 +123,16 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 
 ## Runtime & tests
 
-- `plugins/ollama/scripts/ollama_companion.py` — read-only tier (`setup`, `run`).
+- `plugins/ollama/scripts/ollama_companion.py` — read-only tier (`setup`, `run`) + model management (`list`, `ps`, `show`, `pull`, `rm`).
 - `plugins/ollama/scripts/ollama_agent.py` — agentic tier (tool loop, path jail, worktree, gate token, shell).
+- `plugins/ollama/scripts/ollama_usage.py` — cloud-usage reader (`set-cookie`, `read`); stdlib only.
+- `plugins/ollama/scripts/ollama_usage_login.py` — optional Playwright session capture.
 
-Self-checks stub the HTTP/daemon layer (no real daemon needed):
+Self-checks stub the HTTP/daemon/network layer (no real daemon, no network needed):
 
 ```bash
 cd plugins/ollama/scripts
-python -m unittest test_ollama_companion test_ollama_agent
+python -m unittest discover -p "test_*.py"
 ```
 
 ## License
