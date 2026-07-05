@@ -21,6 +21,7 @@ import urllib.request
 DEFAULT_MODEL = os.environ.get("OLLAMA_CC_MODEL", "glm-5.2:cloud")
 TIMEOUT = 120  # ponytail: fixed 120s; --timeout overrides for huge-diff reviews
 PROMPT_WARN_CHARS = 100_000  # ~30k tokens; warn (never block) so an oversized diff can't silently overflow a ~32k-ctx model
+EXIT_CONFIRM = 10  # pull/rm refuse to mutate without --yes; signals "confirm, then re-run with --yes"
 
 
 def _resolve_host():
@@ -59,6 +60,44 @@ def _post(path, payload, timeout=TIMEOUT):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def _post_stream(path, payload, timeout=TIMEOUT):
+    """POST that yields one parsed JSON object per NDJSON line (e.g. /api/pull progress)."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        _url(path), data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for line in r:
+            line = line.strip()
+            if line:
+                yield json.loads(line.decode("utf-8"))
+
+
+def _delete(path, payload, timeout=TIMEOUT):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        _url(path), data=body,
+        headers={"Content-Type": "application/json"}, method="DELETE",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%d %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024
+
+
+def _norm_tag(name):
+    """A bare model name implies the :latest tag (ollama convention), so that
+    `all-minilm` matches the installed `all-minilm:latest`."""
+    return name if ":" in name else name + ":latest"
 
 
 def is_cloud(name, entry=None):
@@ -194,6 +233,164 @@ def cmd_run(args):
     return 0
 
 
+def _model_size(name):
+    """Local on-disk size (bytes) of an installed model, or None if absent/unlistable."""
+    try:
+        for m in _get("/api/tags").get("models", []):
+            if _norm_tag(m.get("name", "")) == _norm_tag(name):
+                return m.get("size")
+    except _CONN_ERRORS:
+        pass
+    return None
+
+
+def cmd_ps(args):
+    try:
+        models = _get("/api/ps").get("models", [])
+    except urllib.error.HTTPError as e:
+        return _http_error(e, "")
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(models, ensure_ascii=False, indent=2))
+        return 0
+    if not models:
+        print("no models are currently loaded in memory.")
+        return 0
+    print("running models:")
+    for m in models:
+        print("  - %s  size=%s vram=%s expires=%s" % (
+            m.get("name", "?"), _human_size(m.get("size")),
+            _human_size(m.get("size_vram")), m.get("expires_at", "?")))
+    return 0
+
+
+def cmd_show(args):
+    try:
+        data = _post("/api/show", {"model": args.model})
+    except urllib.error.HTTPError as e:
+        return _http_error(e, args.model)
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    det = data.get("details") or {}
+    size = _model_size(args.model)
+    print("model: %s" % args.model)
+    print("  family:       %s" % det.get("family", "?"))
+    print("  parameters:   %s" % det.get("parameter_size", "?"))
+    print("  quantization: %s" % det.get("quantization_level", "?"))
+    if size is not None:
+        print("  size:         %s" % _human_size(size))
+    params = (data.get("parameters") or "").strip()
+    if params:
+        print("  default parameters:")
+        for line in params.splitlines():
+            print("    " + line)
+    return 0
+
+
+def cmd_pull(args):
+    model = args.model
+    if not args.yes:
+        size = _model_size(model)
+        if size is not None:
+            print("'%s' is already installed (%s). Re-run with --yes to re-pull/update it."
+                  % (model, _human_size(size)))
+        else:
+            print("About to download '%s' from the registry -- this can be several GB and "
+                  "take a while. Re-run with --yes to proceed." % model)
+        return EXIT_CONFIRM
+    streamed = False
+    ok = False
+    try:
+        for evt in _post_stream("/api/pull", {"model": model, "stream": True}, timeout=args.timeout):
+            if evt.get("error"):
+                if streamed:
+                    sys.stdout.write("\n")
+                print("error: %s" % evt["error"], file=sys.stderr)
+                return 1
+            total, done = evt.get("total"), evt.get("completed")
+            status = evt.get("status", "")
+            if status == "success":
+                ok = True
+            if total and done:
+                sys.stdout.write("\r%s: %d%% (%s / %s)   " % (
+                    status, done * 100 // total, _human_size(done), _human_size(total)))
+                sys.stdout.flush()
+                streamed = True
+            else:
+                if streamed:
+                    sys.stdout.write("\n")
+                    streamed = False
+                print(status)
+    except urllib.error.HTTPError as e:
+        return _http_error(e, model)
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    if streamed:
+        sys.stdout.write("\n")
+    # A stream that ends without a terminal "success" was truncated/dropped:
+    # reporting "pulled" then would be a false success on a partial download.
+    if not ok:
+        print("error: pull of '%s' ended without a success status (stream truncated?)."
+              % model, file=sys.stderr)
+        return 1
+    print("pulled '%s'." % model)
+    return 0
+
+
+def cmd_rm(args):
+    model = args.model
+    try:
+        tags = _get("/api/tags").get("models", [])
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    match = next((m for m in tags if _norm_tag(m.get("name", "")) == _norm_tag(model)), None)
+    if match is None:
+        print("'%s' is not installed -- nothing to delete." % model, file=sys.stderr)
+        return 4
+    full, size = match.get("name", model), match.get("size")
+    if not args.yes:
+        print("About to DELETE '%s' (%s). Re-run with --yes to confirm." % (full, _human_size(size)))
+        return EXIT_CONFIRM
+    try:
+        _delete("/api/delete", {"model": full})
+    except urllib.error.HTTPError as e:
+        return _http_error(e, full)
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    print("deleted '%s' (%s freed)." % (full, _human_size(size)))
+    return 0
+
+
+def cmd_list(args):
+    try:
+        tags = _get("/api/tags").get("models", [])
+    except _CONN_ERRORS:
+        print(_daemon_down_msg(), file=sys.stderr)
+        return 3
+    models = [{"name": m.get("name"), "size": m.get("size"), "cloud": is_cloud(m.get("name"), m)}
+              for m in tags]
+    if args.json:
+        print(json.dumps(models, ensure_ascii=False, indent=2))
+        return 0
+    if not models:
+        print("no models installed. Pull one, e.g. `ollama pull glm-5.2:cloud`.")
+        return 0
+    print("available models:")
+    for m in models:
+        print("  - %s%s  %s" % (
+            m["name"], "  [cloud]" if m["cloud"] else "", _human_size(m["size"])))
+    return 0
+
+
 def main(argv=None):
     # Windows consoles default to cp949 here; force utf-8 so non-ASCII model
     # output does not crash on print (verified failure mode).
@@ -218,6 +415,30 @@ def main(argv=None):
     pr.add_argument("--show-thinking", action="store_true", help="print reasoning to stderr")
     pr.add_argument("--timeout", type=int, default=TIMEOUT)
     pr.set_defaults(func=cmd_run)
+
+    pls = sub.add_parser("list", help="list installed/available models")
+    pls.add_argument("--json", action="store_true")
+    pls.set_defaults(func=cmd_list)
+
+    pps = sub.add_parser("ps", help="list running (in-memory) models")
+    pps.add_argument("--json", action="store_true")
+    pps.set_defaults(func=cmd_ps)
+
+    psh = sub.add_parser("show", help="show model details (family, params, quantization, size)")
+    psh.add_argument("model")
+    psh.add_argument("--json", action="store_true")
+    psh.set_defaults(func=cmd_show)
+
+    ppl = sub.add_parser("pull", help="download/install a model (requires --yes to proceed)")
+    ppl.add_argument("model")
+    ppl.add_argument("--yes", action="store_true", help="confirm the download")
+    ppl.add_argument("--timeout", type=int, default=TIMEOUT)
+    ppl.set_defaults(func=cmd_pull)
+
+    prm = sub.add_parser("rm", help="delete an installed model (requires --yes to proceed)")
+    prm.add_argument("model")
+    prm.add_argument("--yes", action="store_true", help="confirm the deletion")
+    prm.set_defaults(func=cmd_rm)
 
     args = p.parse_args(argv)
     return args.func(args)
