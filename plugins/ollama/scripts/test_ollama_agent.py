@@ -222,6 +222,29 @@ class LoopTest(unittest.TestCase):
         tool_msgs = [m for m in seq.payloads[1]["messages"] if m.get("role") == "tool"]
         self.assertEqual({m["tool_call_id"] for m in tool_msgs}, {"c1", "c2"})
 
+    def test_reread_after_write_is_not_auto_advanced(self):
+        # read -> write (grows the file) -> read again: the second read must honor offset 0
+        # and see the freshly written start, not auto-advance past it on stale read_progress.
+        p = os.path.join(self.d, "f.txt")
+        with open(p, "w") as fh:
+            fh.write("OLD")                 # 3 bytes -> first read sets read_progress to 3
+        new = "NEW-" + "Z" * 40             # 44 bytes, larger than the old size
+        seq = _SeqPost([
+            _asst(tool_calls=[_call("read_file", {"path": "f.txt"}, "r1")]),
+            _asst(tool_calls=[_call("write_file", {"path": "f.txt", "content": new}, "w1")]),
+            _asst(tool_calls=[_call("read_file", {"path": "f.txt"}, "r2")]),
+            _asst(content="done"),
+        ])
+        oa._post = seq
+        r = oa.run_agent("edit then verify", self.d)
+        self.assertEqual(r["stop_reason"], "done")
+        msgs = seq.payloads[-1]["messages"]
+        r2 = [m for m in msgs if m.get("role") == "tool" and m.get("tool_call_id") == "r2"]
+        self.assertTrue(r2, "second read produced no tool result")
+        self.assertTrue(r2[-1]["content"].startswith("NEW-"),
+                        "re-read after write was auto-advanced past the new content: %r"
+                        % r2[-1]["content"][:20])
+
     def test_read_file_is_bounded_and_offset_paginates(self):
         with open(os.path.join(self.d, "big.txt"), "w") as f:
             f.write("A" * (oa.READ_CAP + 100))
@@ -231,6 +254,100 @@ class LoopTest(unittest.TestCase):
         rest = oa.tool_read_file(self.d, {"path": "big.txt", "offset": oa.READ_CAP})
         self.assertNotIn("[truncated", rest)
         self.assertTrue(rest.startswith("A"))
+
+    def test_next_read_offset_advances_a_reread(self):
+        # re-requesting an already-served range with more file left -> next unread chunk
+        self.assertEqual(oa._next_read_offset(0, 65536, 200000), 65536)
+
+    def test_next_read_offset_honors_forward_request(self):
+        # an explicit offset past what's served is a real request, not a re-read
+        self.assertEqual(oa._next_read_offset(131072, 65536, 200000), 131072)
+
+    def test_next_read_offset_no_advance_when_fully_read(self):
+        # whole file already served -> do NOT advance, so a true spin still trips the loop guard
+        self.assertEqual(oa._next_read_offset(0, 200000, 200000), 0)
+
+    def test_derive_read_cap_clamps_floor(self):
+        self.assertEqual(oa._derive_read_cap(1000), 16 * 1024)        # tiny budget -> floor
+
+    def test_derive_read_cap_clamps_ceiling(self):
+        self.assertEqual(oa._derive_read_cap(10_000_000), 96 * 1024)  # huge budget -> cap
+
+    def test_derive_read_cap_scales_between(self):
+        self.assertEqual(oa._derive_read_cap(150000), 50000)         # 150000 // 3, within range
+
+    def test_system_prompt_readonly_omits_write_mandate(self):
+        # a --readonly run has no write tool; it must not be told it FAILED for only reading
+        ro = oa._system_prompt("/root", allow_write=False)
+        rw = oa._system_prompt("/root", allow_write=True)
+        self.assertNotIn("FAILED", ro)
+        self.assertNotIn("write_file", ro)
+        self.assertIn("write_file", rw)                   # write runs still get the write nudge
+        self.assertIn("do NOT read the same file", ro)    # anti-re-read nudge applies in both modes
+
+    def test_detect_context_length_non_dict_response_is_none(self):
+        # a valid but wrong-shaped JSON body must not crash the best-effort probe
+        orig = oa._post
+        oa._post = lambda *a, **k: ["not", "a", "dict"]
+        try:
+            self.assertIsNone(oa._detect_context_length("x:cloud"))
+        finally:
+            oa._post = orig
+
+    def test_resolve_num_ctx_env_override_wins(self):
+        old = os.environ.get("OLLAMA_CC_NUM_CTX")
+        os.environ["OLLAMA_CC_NUM_CTX"] = "8192"
+        try:
+            self.assertEqual(oa._resolve_num_ctx("x:cloud"), 8192)
+        finally:
+            os.environ.pop("OLLAMA_CC_NUM_CTX", None)
+            if old is not None:
+                os.environ["OLLAMA_CC_NUM_CTX"] = old
+
+    def test_resolve_num_ctx_cloud_detected_is_clamped(self):
+        old = os.environ.get("OLLAMA_CC_NUM_CTX")
+        os.environ.pop("OLLAMA_CC_NUM_CTX", None)
+        orig = oa._detect_context_length
+        oa._detect_context_length = lambda m: 1_000_000              # a cloud model advertising a 1M window
+        try:
+            self.assertEqual(oa._resolve_num_ctx("x:cloud"), oa.NUM_CTX_CEILING)
+        finally:
+            oa._detect_context_length = orig
+            if old is not None:
+                os.environ["OLLAMA_CC_NUM_CTX"] = old
+
+    def test_resolve_num_ctx_garbage_env_falls_to_safe_default(self):
+        # a typo'd env (e.g. "32k") must NOT silently fall through to a cloud auto-crank
+        def _boom(m):
+            raise AssertionError("garbage env must not reach context detection")
+        old = os.environ.get("OLLAMA_CC_NUM_CTX")
+        os.environ["OLLAMA_CC_NUM_CTX"] = "32k"
+        orig = oa._detect_context_length
+        oa._detect_context_length = _boom
+        try:
+            self.assertEqual(oa._resolve_num_ctx("x:cloud"), 32768)
+        finally:
+            oa._detect_context_length = orig
+            if old is None:
+                os.environ.pop("OLLAMA_CC_NUM_CTX", None)
+            else:
+                os.environ["OLLAMA_CC_NUM_CTX"] = old
+
+    def test_resolve_num_ctx_local_stays_conservative(self):
+        # a local model is NOT auto-cranked (would risk a local-GPU OOM) -> conservative default,
+        # and detection is never even attempted for it.
+        def _boom(m):
+            raise AssertionError("local model must not trigger context detection")
+        old = os.environ.get("OLLAMA_CC_NUM_CTX")
+        os.environ.pop("OLLAMA_CC_NUM_CTX", None)
+        orig_c, orig_d = oa.is_cloud, oa._detect_context_length
+        oa.is_cloud, oa._detect_context_length = (lambda m: False), _boom
+        try:
+            self.assertEqual(oa._resolve_num_ctx("llama3.2:latest"), 32768)
+        finally:
+            oa.is_cloud, oa._detect_context_length = orig_c, orig_d
+            if old is not None:
+                os.environ["OLLAMA_CC_NUM_CTX"] = old
 
 
 class FallbackTest(unittest.TestCase):

@@ -36,7 +36,7 @@ import tempfile
 import time
 
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
-from ollama_companion import _post, DEFAULT_MODEL  # noqa: E402
+from ollama_companion import _post, DEFAULT_MODEL, is_cloud  # noqa: E402
 
 
 def _int_env(name, default):
@@ -47,7 +47,6 @@ def _int_env(name, default):
         return default
 
 
-READ_CAP = 16 * 1024          # bytes returned to the model per read/tool result
 WRITE_CAP = 1024 * 1024       # 1 MiB per write_file: ample for source, caps a runaway model from filling the worktree disk before review
 EGRESS_BUDGET = 8 * 1024 * 1024
 MAX_ITERS = 15
@@ -56,9 +55,54 @@ TOOL_CALL_CAP = 40
 MALFORMED_CAP = 3
 LOOP_REPEAT_CAP = 3           # identical non-write call N times -> loop
 NUM_CTX = _int_env("OLLAMA_CC_NUM_CTX", 32768)   # options.num_ctx; default assumes a >=32k model. Lower via OLLAMA_CC_NUM_CTX for a small local model.
+NUM_CTX_CEILING = _int_env("OLLAMA_CC_NUM_CTX_MAX", 131072)  # cap for auto-detected num_ctx (models advertise up to 1M; don't crank the window off a cost/OOM cliff)
 # ponytail: char proxy for the token budget at ~2.75 chars/token, kept under NUM_CTX so the
 # server never front-truncates our pinned system+task (client _truncate_history does it first).
 CTX_CHAR_BUDGET = int(NUM_CTX * 2.75)
+
+
+def _derive_read_cap(char_budget):
+    """Bytes per read/tool result: ~1/3 of the context budget so one read never swamps the
+    window (room for the system prompt, task, prior reads and the reply), clamped so it stays
+    useful for a tiny model and bounded for a huge one."""
+    return max(16 * 1024, min(96 * 1024, char_budget // 3))
+
+
+READ_CAP = _derive_read_cap(CTX_CHAR_BUDGET)
+
+
+def _detect_context_length(model):
+    """The model's real context window from /api/show model_info, or None on any failure
+    (best-effort; the caller falls back to the conservative default rather than crash)."""
+    try:
+        info = _post("/api/show", {"model": model}, timeout=10)
+    except Exception:  # noqa: BLE001 - any transport/parse failure -> fall back, never crash the run
+        return None
+    mi = info.get("model_info") if isinstance(info, dict) else None
+    if not isinstance(mi, dict):   # a valid but non-dict JSON body must not crash the best-effort probe
+        return None
+    for k, v in mi.items():
+        if k.endswith(".context_length") and isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def _resolve_num_ctx(model):
+    """Effective options.num_ctx for `model`. An explicit OLLAMA_CC_NUM_CTX always wins.
+    Otherwise CLOUD models (no local GPU to OOM) auto-size to their real context clamped to
+    NUM_CTX_CEILING; LOCAL models keep the conservative default so auto-detect never cranks a
+    local KV cache into an OOM -- raise a local model per-run with OLLAMA_CC_NUM_CTX."""
+    env = os.environ.get("OLLAMA_CC_NUM_CTX")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            return 32768   # set-but-unparseable -> the safe default; never fall through to an auto-crank
+    if is_cloud(model):
+        detected = _detect_context_length(model)
+        if detected:
+            return min(detected, max(1, NUM_CTX_CEILING))   # guard a mis-set (<=0) ceiling
+    return 32768
 
 
 class JailError(Exception):
@@ -117,6 +161,16 @@ def tool_read_file(root_real, args):
         text += ("\n[truncated at %d bytes; call read_file again with offset=%d for more]"
                  % (READ_CAP, offset + READ_CAP))
     return text
+
+
+def _next_read_offset(requested, served_to, filesize):
+    """Advance a re-read to the next unread chunk. A weaker model that loses track
+    re-requests a file at an already-served offset (requested < served_to) instead of
+    the next chunk; when the file has more to give, return the next unread offset so
+    the read progresses (and its loop-key changes) instead of spinning on one range."""
+    if requested < served_to < filesize:
+        return served_to
+    return requested
 
 
 def tool_write_file(root_real, args):
@@ -217,14 +271,17 @@ def tool_run_shell(root_real, args):
     if not cmd or not str(cmd).strip():
         raise JailError("run_shell requires 'cmd'")
     env = {k: os.environ[k] for k in _SHELL_ENV_KEYS if k in os.environ}
-    # new process group/session so the whole tree can be killed on timeout
+    # new process group/session so the whole tree can be killed on timeout; decode
+    # child output as UTF-8, not the host cp949 codepage (else non-ASCII output crashes)
     if os.name == "nt":
         p = subprocess.Popen(str(cmd), shell=True, cwd=root_real, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace",
                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
         p = subprocess.Popen(str(cmd), shell=True, cwd=root_real, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace",
                              start_new_session=True)
     try:
         out, err = p.communicate(timeout=60)
@@ -387,11 +444,23 @@ def _force_synthesis(messages, model, think, num_ctx, remaining_timeout, remaini
 
 
 # ---------------------------------------------------------------- the loop
-def _system_prompt(root):
+def _system_prompt(root, allow_write=True):
+    # The "must write, else FAILED" mandate applies ONLY when write_file exists. A --readonly
+    # run has no write tool and a read-only completion is a valid, finished run -- telling it
+    # the run FAILED and to call write_file would break every review-only task.
+    if allow_write:
+        how = ("Use read_file to inspect and write_file to make changes. You keep the full "
+               "content of every file you have already read -- do NOT read the same file again. "
+               "Once you understand the task, STOP reading and call write_file; a run that only "
+               "reads and never writes has FAILED. ")
+    else:
+        how = ("Use read_file, list_dir and grep_search to inspect -- this run is READ-ONLY, "
+               "there is no write tool. You keep the full content of every file you have already "
+               "read -- do NOT read the same file again. Once you have enough context, STOP "
+               "reading and give your final answer. ")
     return (
         "You are a coding agent working inside a working root you cannot escape: "
-        "every path you pass to a tool is relative to that root and is confined to it. "
-        "Use read_file to inspect and write_file to make changes. "
+        "every path you pass to a tool is relative to that root and is confined to it. " + how +
         "Do only what the task asks. When the task is complete, reply with a short "
         "final summary and DO NOT call any more tools.\n"
         "Working root: %s" % root)
@@ -411,12 +480,13 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
     root_real = os.path.realpath(root)
     if not os.path.isdir(root_real):
         return {"stop_reason": "bad_root", "error": "root is not a directory: %s" % root}
-    messages = [{"role": "system", "content": _system_prompt(root_real)},
+    messages = [{"role": "system", "content": _system_prompt(root_real, allow_write=allow_write)},
                 {"role": "user", "content": task}]
     pinned = 2
     iters = tool_calls_total = malformed = egress_bytes = 0
     seen = {}                 # loop-key -> count
     written = set()           # canonical paths written -> exempt a following re-read from loop-kill
+    read_progress = {}        # canon path -> next unread byte offset (drives read auto-advance)
     actions = []
     start = time.monotonic()
 
@@ -494,6 +564,19 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                     canon = resolve_in_jail(root_real, args["path"])
                 except JailError:
                     canon = None
+            # Auto-advance a re-read to the next unread chunk so a model that re-requests
+            # an already-served range progresses instead of spinning until the loop guard
+            # aborts. Changing the offset also changes the loop-key below, so real progress
+            # never counts as a loop.
+            if name == "read_file" and canon and os.path.isfile(canon):
+                try:
+                    req_off = max(0, int(args.get("offset") or 0))
+                except (TypeError, ValueError):
+                    req_off = 0
+                eff_off = _next_read_offset(req_off, read_progress.get(canon, 0),
+                                            os.path.getsize(canon))
+                if eff_off != req_off:
+                    args = {**args, "offset": eff_off}
             key_args = dict(args)
             if canon:
                 key_args["path"] = canon
@@ -512,8 +595,16 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                 ok = True
                 if name == "write_file":
                     written.add(canon)
+                    read_progress.pop(canon, None)   # file changed -> stale read offsets no longer valid (else a read-back auto-advances past the new content)
                 elif name == "read_file":
                     written.discard(canon)
+                    if canon and os.path.isfile(canon):
+                        try:
+                            eff_off = max(0, int(args.get("offset") or 0))
+                        except (TypeError, ValueError):
+                            eff_off = 0
+                        read_progress[canon] = max(read_progress.get(canon, 0),
+                                                   min(os.path.getsize(canon), eff_off + READ_CAP))
             except JailError as e:
                 result, ok = "error: %s" % e, False
             except Exception as e:  # noqa: BLE001
@@ -524,7 +615,13 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
 
 # ---------------------------------------------------------------- git worktree (P2)
 def _git(repo, *args, check=False):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    # Decode git output as UTF-8, not the host cp949 codepage, else a diff/status
+    # carrying non-ASCII bytes crashes on a Korean-Windows host.
+    # ponytail: errors=replace can't round-trip a non-UTF-8 blob byte-exact for a
+    # later `git apply`; safe for UTF-8 repos, switch the diff capture to binary
+    # mode if a non-UTF-8 repo ever needs it.
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if check and r.returncode != 0:
         raise GitError("git %s failed: %s" % (args[0], (r.stderr or r.stdout).strip()))
     return r
@@ -654,6 +751,12 @@ def main(argv=None):
     p.add_argument("--max-iters", type=int, default=MAX_ITERS)
     p.add_argument("--timeout", type=int, default=TIMEOUT_TOTAL)
     args = p.parse_args(argv)
+    # Size the context window (and the derived read cap) to the chosen model before running:
+    # an explicit OLLAMA_CC_NUM_CTX wins, else a cloud model auto-sizes to its real window.
+    global NUM_CTX, CTX_CHAR_BUDGET, READ_CAP
+    NUM_CTX = _resolve_num_ctx(args.model or DEFAULT_MODEL)
+    CTX_CHAR_BUDGET = int(NUM_CTX * 2.75)
+    READ_CAP = _derive_read_cap(CTX_CHAR_BUDGET)
     if args.task_file:
         with open(args.task_file, "r", encoding="utf-8") as f:
             task = f.read()
