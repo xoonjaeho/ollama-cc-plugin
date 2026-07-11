@@ -26,6 +26,7 @@ class _Args:
         self.think = kw.get("think", False)
         self.show_thinking = kw.get("show_thinking", False)
         self.timeout = kw.get("timeout", 120)
+        self.stream = kw.get("stream", False)
 
 
 class _RecordingStream:
@@ -78,6 +79,53 @@ class TestRun(unittest.TestCase):
             rc = oc.cmd_run(_Args(prompt="ping"))
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue().strip(), "pong")
+
+    def test_stream_concatenates_content_chunks(self):
+        def fake_stream(path, payload, timeout=None):
+            assert payload.get("stream") is True   # streaming must request stream:true
+            yield {"message": {"content": "Hel"}}
+            yield {"message": {"content": "lo"}, "done": True}
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                rc = oc.cmd_run(_Args(prompt="hi", stream=True))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), "Hello")
+
+    def test_stream_idle_timeout_maps_to_exit_6(self):
+        def fake_stream(path, payload, timeout=None):
+            raise socket.timeout("timed out")
+            yield  # makes this a generator; the raise fires on first iteration
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                rc = oc.cmd_run(_Args(prompt="hi", stream=True))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 6)
+        self.assertIn("idle", err.getvalue())
+
+    def test_stream_without_done_marker_flags_truncation(self):
+        # stream ends with content but no terminal done:true -> flag as possibly truncated, not success
+        def fake_stream(path, payload, timeout=None):
+            yield {"message": {"content": "partial"}}
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = oc.cmd_run(_Args(prompt="hi", stream=True))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("partial", out.getvalue())            # partial content is still shown
+        self.assertIn("truncat", err.getvalue().lower())    # and flagged
 
     def test_oversized_prompt_warns_but_proceeds(self):
         oc._post = lambda *a, **k: {"message": {"content": "ok"}}

@@ -186,6 +186,54 @@ def _http_error(e, model):
     return 1
 
 
+def _run_stream(payload, model, args):
+    """Stream /api/chat, writing content deltas as they arrive. With streaming, args.timeout is
+    the socket read timeout = the max idle gap between chunks, so a long-but-progressing review
+    is not killed by a total cap while a truly stalled stream still aborts."""
+    got = False
+    done_seen = False
+    try:
+        for evt in _post_stream("/api/chat", payload, timeout=args.timeout):
+            if evt.get("error"):
+                print("\nerror: ollama: %s" % evt["error"], file=sys.stderr)
+                return 1
+            msg = evt.get("message") or {}
+            if args.show_thinking and msg.get("thinking"):
+                sys.stderr.write(msg["thinking"])
+                sys.stderr.flush()
+            chunk = msg.get("content") or ""
+            if chunk:
+                got = True
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            if evt.get("done"):
+                done_seen = True
+                break
+    except urllib.error.HTTPError as e:
+        return _http_error(e, model)
+    except json.JSONDecodeError:
+        print("\nerror: ollama returned a non-JSON stream line.", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, socket.timeout) or "timed out" in str(reason).lower():
+            print("\nerror: stream from '%s' idle >%ss (no new tokens)." % (model, args.timeout),
+                  file=sys.stderr)
+            return 6
+        print("\nerror: " + _daemon_down_msg(), file=sys.stderr)
+        return 3
+    if not got:
+        print("error: ollama returned an empty response (model '%s')." % model, file=sys.stderr)
+        return 1
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    if not done_seen:   # stream ended before the terminal done:true -> the reply is likely truncated
+        print("warning: stream ended without a completion marker; the reply may be truncated.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_run(args):
     model = args.model or DEFAULT_MODEL
     raw = args.prompt if args.prompt is not None else sys.stdin.read()
@@ -200,9 +248,11 @@ def cmd_run(args):
         "model": model,
         # unstripped: preserve significant whitespace in a piped diff
         "messages": [{"role": "user", "content": raw}],
-        "stream": False,
+        "stream": bool(args.stream),
         "think": bool(args.think),
     }
+    if args.stream:
+        return _run_stream(payload, model, args)
     try:
         data = _post("/api/chat", payload, timeout=args.timeout)
     except urllib.error.HTTPError as e:
@@ -414,6 +464,8 @@ def main(argv=None):
     pr.add_argument("--think", action="store_true", help="enable model reasoning")
     pr.add_argument("--show-thinking", action="store_true", help="print reasoning to stderr")
     pr.add_argument("--timeout", type=int, default=TIMEOUT)
+    pr.add_argument("--stream", action="store_true",
+                    help="stream the reply as generated; with --stream, --timeout is the max idle gap between chunks (a hang detector), not a total cap")
     pr.set_defaults(func=cmd_run)
 
     pls = sub.add_parser("list", help="list installed/available models")
