@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_CC_MODEL", "glm-5.2:cloud")
-TIMEOUT = 120  # ponytail: fixed 120s; --timeout overrides for huge-diff reviews
+TIMEOUT = 600  # ponytail: default 600s; --timeout overrides for huge-diff reviews
 PROMPT_WARN_CHARS = 100_000  # ~30k tokens; warn (never block) so an oversized diff can't silently overflow a ~32k-ctx model
 EXIT_CONFIRM = 10  # pull/rm refuse to mutate without --yes; signals "confirm, then re-run with --yes"
 
