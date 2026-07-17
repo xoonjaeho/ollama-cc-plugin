@@ -30,7 +30,7 @@ Two tiers:
 - **ollama** running locally (`ollama serve` or the Ollama app). Verify with `ollama --version`.
 - **Python 3.x** on `PATH` (stdlib-only, no packages). On Windows, `py -3` is a fallback if `python` is missing.
 - **git** on `PATH` (the agentic rescue uses `git worktree`).
-- For **cloud models** (any model whose name contains `cloud`, e.g. `glm-5.2:cloud`): sign in once with `ollama signin`.
+- For **cloud models** (any model whose name contains `cloud`, e.g. `glm-5.2:cloud`): sign in once with `ollama signin`. Cloud models can rarely return a truncated reply as a normal completion; if the answer looks cut off, re-run the command.
 - **Optional**, only for `/ollama:usage-login` (browser-based session capture): the `playwright` package (`pip install playwright`) + Google Chrome. The manual `/ollama:usage` setup needs nothing extra.
 
 ## Install

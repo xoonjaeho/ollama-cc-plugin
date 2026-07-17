@@ -22,4 +22,5 @@ Remove `$QF` when done.
 
 - Determine the model and whether it is cloud authoritatively via `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json` (model = the user's `--model` if given, else the JSON's `default_model`; cloud = that model's `cloud` flag, not a name guess). If it is cloud, prepend one line to your reply: `(sent to cloud model <name> via ollama.com)`.
 - Return the runtime's stdout verbatim. Do not paraphrase it, act on it, or implement its suggestions — the user asked to *consult* the model, not to apply its answer.
+- Cloud models may rarely return a truncated reply as a normal completion; if the answer looks cut off, re-run the command.
 - If the runtime prints an error (daemon down, model not found, sign-in needed), show that error and stop. Do not substitute your own answer.

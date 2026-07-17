@@ -190,6 +190,120 @@ class TestRun(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("not reachable", err.getvalue())
 
+    def test_empty_response_retries_once_then_succeeds(self):
+        calls = []
+        def seq(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"message": {"content": ""}}
+            return {"message": {"content": "retry-answer"}}
+        oc._post = seq
+        out = io.StringIO()
+        with redirect_stdout(out):
+            # Use a local model so _resolve_num_ctx does not make an extra /api/show call.
+            rc = oc.cmd_run(_Args(model="llama3.2:latest"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out.getvalue().strip(), "retry-answer")
+
+    def test_empty_response_retry_once_then_fails(self):
+        calls = []
+        def empty(*a, **k):
+            calls.append(1)
+            return {"message": {"content": ""}}
+        oc._post = empty
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = oc.cmd_run(_Args(model="llama3.2:latest"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("empty response", err.getvalue())
+
+    def test_show_thinking_stream_does_not_dup_to_stdout(self):
+        def fake_stream(path, payload, timeout=None):
+            yield {"message": {"content": "ok", "thinking": "reasoning"}}
+            yield {"message": {"content": "!"}, "done": True}
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = oc.cmd_run(_Args(stream=True, show_thinking=True))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), "ok!")
+        self.assertIn("reasoning", err.getvalue())
+
+    def test_show_thinking_fallback_does_not_dup_to_stderr(self):
+        oc._post = lambda *a, **k: {"message": {"content": "", "thinking": "only-reasoning"}}
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = oc.cmd_run(_Args(show_thinking=True))
+        self.assertEqual(rc, 0)
+        self.assertIn("only-reasoning", out.getvalue())
+        self.assertNotIn("only-reasoning", err.getvalue())
+
+    def test_show_thinking_stream_tees_reasoning_before_content(self):
+        # Reasoning models emit thinking BEFORE content; --show-thinking must still show it
+        # (buffered pre-content reasoning is flushed to stderr once the answer begins).
+        def fake_stream(path, payload, timeout=None):
+            yield {"message": {"thinking": "step-by-step"}}
+            yield {"message": {"content": "answer"}, "done": True}
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = oc.cmd_run(_Args(stream=True, show_thinking=True, model="llama3.2:latest"))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), "answer")    # answer only on stdout
+        self.assertIn("step-by-step", err.getvalue())          # pre-content reasoning teed
+
+    def test_empty_content_with_thinking_still_retries(self):
+        # Reasoning present must NOT short-circuit the A2 retry: content is what counts;
+        # thinking is only a fallback after the retry also yields no content.
+        calls = []
+        def seq(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"message": {"content": "", "thinking": "draft"}}
+            return {"message": {"content": "real answer"}}
+        oc._post = seq
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = oc.cmd_run(_Args(model="llama3.2:latest"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 2)                        # retried despite thinking present
+        self.assertEqual(out.getvalue().strip(), "real answer")
+
+    def test_stream_reasoning_only_without_done_flags_truncation(self):
+        # A reasoning-only stream that never sees done:true was truncated: show the reasoning
+        # but exit non-zero -- do not report a silent success.
+        def fake_stream(path, payload, timeout=None):
+            yield {"message": {"thinking": "partial reasoning"}}
+        orig = oc._post_stream
+        oc._post_stream = fake_stream
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = oc.cmd_run(_Args(stream=True, model="llama3.2:latest"))
+        finally:
+            oc._post_stream = orig
+        self.assertEqual(rc, 1)                                # truncation -> failure, not rc0
+        self.assertIn("partial reasoning", out.getvalue())     # reasoning still shown
+        self.assertIn("truncat", err.getvalue().lower())       # and flagged
+
+
+class TestFinalText(unittest.TestCase):
+    def test_thinking_fills_empty_content(self):
+        self.assertEqual(oc._final_text({"content": "", "thinking": "x"}), "x")
+
+    def test_whitespace_content_does_not_mask_thinking(self):
+        self.assertEqual(oc._final_text({"content": "   ", "thinking": "y"}), "y")
+
 
 class TestMainReconfigure(unittest.TestCase):
     """The cp949 fix lives in main(): deleting the reconfigure loop must fail here."""

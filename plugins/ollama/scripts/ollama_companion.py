@@ -24,6 +24,18 @@ PROMPT_WARN_CHARS = 100_000  # ~30k tokens; warn (never block) so an oversized d
 EXIT_CONFIRM = 10  # pull/rm refuse to mutate without --yes; signals "confirm, then re-run with --yes"
 
 
+def _int_env(name, default):
+    """int() an env var, falling back to default on unset or unparseable value."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+NUM_CTX = _int_env("OLLAMA_CC_NUM_CTX", 32768)   # options.num_ctx; default assumes a >=32k model
+NUM_CTX_CEILING = _int_env("OLLAMA_CC_NUM_CTX_MAX", 131072)  # cap for auto-detected num_ctx
+
+
 def _resolve_host():
     # Prefer our own var; fall back to ollama's standard OLLAMA_HOST (often a
     # bare host:port with no scheme), then localhost.
@@ -109,6 +121,46 @@ def is_cloud(name, entry=None):
     return bool(name) and "cloud" in name.lower()
 
 
+def _final_text(msg):
+    """Whitespace-safe content first, thinking fallback. Shared by companion and agent
+    so all paths agree on what counts as an answer."""
+    return (msg.get("content") or "").strip() or (msg.get("thinking") or "").strip()
+
+
+def _detect_context_length(model):
+    """The model's real context window from /api/show model_info, or None on any failure
+    (best-effort; the caller falls back to the conservative default rather than crash)."""
+    try:
+        info = _post("/api/show", {"model": model}, timeout=10)
+    except Exception:  # noqa: BLE001 - any transport/parse failure -> fall back, never crash the run
+        return None
+    mi = info.get("model_info") if isinstance(info, dict) else None
+    if not isinstance(mi, dict):   # a valid but non-dict JSON body must not crash the best-effort probe
+        return None
+    for k, v in mi.items():
+        if k.endswith(".context_length") and isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def _resolve_num_ctx(model):
+    """Effective options.num_ctx for `model`. An explicit OLLAMA_CC_NUM_CTX always wins.
+    Otherwise CLOUD models (no local GPU to OOM) auto-size to their real context clamped to
+    NUM_CTX_CEILING; LOCAL models keep the conservative default so auto-detect never cranks a
+    local KV cache into an OOM -- raise a local model per-run with OLLAMA_CC_NUM_CTX."""
+    env = os.environ.get("OLLAMA_CC_NUM_CTX")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            return 32768   # set-but-unparseable -> the safe default; never fall through to an auto-crank
+    if is_cloud(model):
+        detected = _detect_context_length(model)
+        if detected:
+            return min(detected, max(1, NUM_CTX_CEILING))   # guard a mis-set (<=0) ceiling
+    return 32768
+
+
 def _daemon_down_msg():
     return ("ollama daemon not reachable at %s. Start it with `ollama serve` "
             "(or launch the Ollama app), then retry." % HOST)
@@ -189,70 +241,86 @@ def _http_error(e, model):
 def _run_stream(payload, model, args):
     """Stream /api/chat, writing content deltas as they arrive. With streaming, args.timeout is
     the socket read timeout = the max idle gap between chunks, so a long-but-progressing review
-    is not killed by a total cap while a truly stalled stream still aborts."""
-    got = False
+    is not killed by a total cap while a truly stalled stream still aborts. A stream that ends
+    with no content at all is retried once; the buffered reasoning carries across both attempts."""
+    think_buf = []
     done_seen = False
-    try:
-        for evt in _post_stream("/api/chat", payload, timeout=args.timeout):
-            if evt.get("error"):
-                print("\nerror: ollama: %s" % evt["error"], file=sys.stderr)
+    for attempt in (0, 1):
+        got = False
+        done_seen = False
+        try:
+            for evt in _post_stream("/api/chat", payload, timeout=args.timeout):
+                if evt.get("error"):
+                    print("\nerror: ollama: %s" % evt["error"], file=sys.stderr)
+                    return 1
+                msg = evt.get("message") or {}
+                chunk = msg.get("content") or ""
+                if chunk:
+                    if not got and args.show_thinking and think_buf:
+                        # Reasoning streamed before the answer began: flush it now so
+                        # --show-thinking still shows a thinking model's pre-answer reasoning.
+                        sys.stderr.write("".join(think_buf))
+                        sys.stderr.flush()
+                    got = True
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                thinking = msg.get("thinking") or ""
+                if thinking:
+                    think_buf.append(thinking)
+                    if args.show_thinking and got:
+                        sys.stderr.write(thinking)
+                        sys.stderr.flush()
+                if evt.get("done"):
+                    done_seen = True
+                    break
+        except urllib.error.HTTPError as e:
+            return _http_error(e, model)
+        except json.JSONDecodeError:
+            print("\nerror: ollama returned a non-JSON stream line.", file=sys.stderr)
+            return 1
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, socket.timeout) or "timed out" in str(reason).lower():
+                print("\nerror: stream from '%s' idle >%ss (no new tokens)." % (model, args.timeout),
+                      file=sys.stderr)
+                return 6
+            print("\nerror: " + _daemon_down_msg(), file=sys.stderr)
+            return 3
+        if got:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            # done_reason is unreliable (cloud models report "stop" even on a truncated reply),
+            # but a missing terminal done:true event still flags a dropped stream.
+            if not done_seen:
+                print("warning: stream ended without a completion marker; the reply may be truncated.",
+                      file=sys.stderr)
                 return 1
-            msg = evt.get("message") or {}
-            if args.show_thinking and msg.get("thinking"):
-                sys.stderr.write(msg["thinking"])
-                sys.stderr.flush()
-            chunk = msg.get("content") or ""
-            if chunk:
-                got = True
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-            if evt.get("done"):
-                done_seen = True
-                break
-    except urllib.error.HTTPError as e:
-        return _http_error(e, model)
-    except json.JSONDecodeError:
-        print("\nerror: ollama returned a non-JSON stream line.", file=sys.stderr)
-        return 1
-    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
-        reason = getattr(e, "reason", e)
-        if isinstance(reason, socket.timeout) or "timed out" in str(reason).lower():
-            print("\nerror: stream from '%s' idle >%ss (no new tokens)." % (model, args.timeout),
+            return 0
+        # No content this attempt. A retry cannot corrupt output (nothing was flushed);
+        # a second empty stream falls through to the reasoning-fallback below.
+        if attempt == 0:
+            continue
+    if think_buf:
+        # Promote the buffered reasoning as the answer. It was never teed to stderr (content
+        # never arrived), so --show-thinking does not duplicate it.
+        sys.stdout.write("[model produced only reasoning, no final answer]\n")
+        sys.stdout.write("".join(think_buf))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        # A reasoning-only reply that also never saw done:true was truncated, not complete.
+        if not done_seen:
+            print("warning: stream ended without a completion marker; the reply may be truncated.",
                   file=sys.stderr)
-            return 6
-        print("\nerror: " + _daemon_down_msg(), file=sys.stderr)
-        return 3
-    if not got:
-        print("error: ollama returned an empty response (model '%s')." % model, file=sys.stderr)
-        return 1
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-    if not done_seen:   # stream ended before the terminal done:true -> the reply is likely truncated
-        print("warning: stream ended without a completion marker; the reply may be truncated.",
-              file=sys.stderr)
-        return 1
-    return 0
+            return 1
+        return 0
+    print("error: ollama returned an empty response (model '%s')." % model, file=sys.stderr)
+    return 1
 
 
-def cmd_run(args):
-    model = args.model or DEFAULT_MODEL
-    raw = args.prompt if args.prompt is not None else sys.stdin.read()
-    if not raw.strip():
-        print("error: empty prompt (pass as an argument or via stdin).", file=sys.stderr)
-        return 2
-    if len(raw) > PROMPT_WARN_CHARS:
-        print("warning: prompt is %d chars (~%dk tokens); may exceed the model's context and be "
-              "silently truncated. Narrow the scope (e.g. --base, fewer files)."
-              % (len(raw), len(raw) // 3000), file=sys.stderr)
-    payload = {
-        "model": model,
-        # unstripped: preserve significant whitespace in a piped diff
-        "messages": [{"role": "user", "content": raw}],
-        "stream": bool(args.stream),
-        "think": bool(args.think),
-    }
-    if args.stream:
-        return _run_stream(payload, model, args)
+def _run_once(payload, model, args, _retried=False):
+    """Single non-stream /api/chat request. Retry once on an empty-content response; fall back
+    to the model's reasoning only after the retry also yields no content, so a transient empty
+    gets a real answer before we settle for reasoning."""
     try:
         data = _post("/api/chat", payload, timeout=args.timeout)
     except urllib.error.HTTPError as e:
@@ -273,14 +341,51 @@ def cmd_run(args):
         print("error: ollama: %s" % data["error"], file=sys.stderr)
         return 1
     message = data.get("message") or {}
-    if args.show_thinking and message.get("thinking"):
+    content = message.get("content") or ""
+    # --show-thinking is a debug tee in the normal (content-arrived) case only, so a
+    # reasoning-to-answer fallback is not echoed twice.
+    if content.strip() and args.show_thinking and message.get("thinking"):
         sys.stderr.write(message["thinking"] + "\n")
-    content = message.get("content", "")
     if not content.strip():
+        # Retry on empty CONTENT even when reasoning is present, so A2 gets a real answer
+        # a chance before we settle for the reasoning fallback.
+        if not _retried:
+            return _run_once(payload, model, args, _retried=True)
+        thinking = (message.get("thinking") or "").strip()
+        if thinking:
+            print("[model produced only reasoning, no final answer]")
+            print(thinking)
+            return 0
         print("error: ollama returned an empty response (model '%s')." % model, file=sys.stderr)
         return 1
     print(content)
     return 0
+
+
+def cmd_run(args):
+    model = args.model or DEFAULT_MODEL
+    raw = args.prompt if args.prompt is not None else sys.stdin.read()
+    if not raw.strip():
+        print("error: empty prompt (pass as an argument or via stdin).", file=sys.stderr)
+        return 2
+    if len(raw) > PROMPT_WARN_CHARS:
+        print("warning: prompt is %d chars (~%dk tokens); may exceed the model's context and be "
+              "silently truncated. Narrow the scope (e.g. --base, fewer files)."
+              % (len(raw), len(raw) // 3000), file=sys.stderr)
+    payload = {
+        "model": model,
+        # unstripped: preserve significant whitespace in a piped diff
+        "messages": [{"role": "user", "content": raw}],
+        "stream": bool(args.stream),
+        "think": bool(args.think),
+    }
+    # Only cloud models get a num_ctx option: auto-cranking a local model's KV cache
+    # can push a local GPU into OOM. Local models use their own defaults.
+    if is_cloud(model):
+        payload["options"] = {"num_ctx": _resolve_num_ctx(model)}
+    if args.stream:
+        return _run_stream(payload, model, args)
+    return _run_once(payload, model, args)
 
 
 def _model_size(name):

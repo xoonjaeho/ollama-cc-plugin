@@ -36,15 +36,9 @@ import tempfile
 import time
 
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
-from ollama_companion import _post, DEFAULT_MODEL, is_cloud  # noqa: E402
-
-
-def _int_env(name, default):
-    """int() an env var, falling back to default on unset or unparseable value."""
-    try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
-        return default
+from ollama_companion import (  # noqa: E402
+    _post, DEFAULT_MODEL, is_cloud, _final_text, NUM_CTX, _resolve_num_ctx,
+)
 
 
 WRITE_CAP = 1024 * 1024       # 1 MiB per write_file: ample for source, caps a runaway model from filling the worktree disk before review
@@ -54,8 +48,6 @@ TIMEOUT_TOTAL = 300           # seconds, whole run
 TOOL_CALL_CAP = 40
 MALFORMED_CAP = 3
 LOOP_REPEAT_CAP = 3           # identical non-write call N times -> loop
-NUM_CTX = _int_env("OLLAMA_CC_NUM_CTX", 32768)   # options.num_ctx; default assumes a >=32k model. Lower via OLLAMA_CC_NUM_CTX for a small local model.
-NUM_CTX_CEILING = _int_env("OLLAMA_CC_NUM_CTX_MAX", 131072)  # cap for auto-detected num_ctx (models advertise up to 1M; don't crank the window off a cost/OOM cliff)
 # ponytail: char proxy for the token budget at ~2.75 chars/token, kept under NUM_CTX so the
 # server never front-truncates our pinned system+task (client _truncate_history does it first).
 CTX_CHAR_BUDGET = int(NUM_CTX * 2.75)
@@ -69,40 +61,6 @@ def _derive_read_cap(char_budget):
 
 
 READ_CAP = _derive_read_cap(CTX_CHAR_BUDGET)
-
-
-def _detect_context_length(model):
-    """The model's real context window from /api/show model_info, or None on any failure
-    (best-effort; the caller falls back to the conservative default rather than crash)."""
-    try:
-        info = _post("/api/show", {"model": model}, timeout=10)
-    except Exception:  # noqa: BLE001 - any transport/parse failure -> fall back, never crash the run
-        return None
-    mi = info.get("model_info") if isinstance(info, dict) else None
-    if not isinstance(mi, dict):   # a valid but non-dict JSON body must not crash the best-effort probe
-        return None
-    for k, v in mi.items():
-        if k.endswith(".context_length") and isinstance(v, int) and v > 0:
-            return v
-    return None
-
-
-def _resolve_num_ctx(model):
-    """Effective options.num_ctx for `model`. An explicit OLLAMA_CC_NUM_CTX always wins.
-    Otherwise CLOUD models (no local GPU to OOM) auto-size to their real context clamped to
-    NUM_CTX_CEILING; LOCAL models keep the conservative default so auto-detect never cranks a
-    local KV cache into an OOM -- raise a local model per-run with OLLAMA_CC_NUM_CTX."""
-    env = os.environ.get("OLLAMA_CC_NUM_CTX")
-    if env:
-        try:
-            return max(1, int(env))
-        except ValueError:
-            return 32768   # set-but-unparseable -> the safe default; never fall through to an auto-crank
-    if is_cloud(model):
-        detected = _detect_context_length(model)
-        if detected:
-            return min(detected, max(1, NUM_CTX_CEILING))   # guard a mis-set (<=0) ceiling
-    return 32768
 
 
 class JailError(Exception):
@@ -439,8 +397,8 @@ def _force_synthesis(messages, model, think, num_ctx, remaining_timeout, remaini
     if not isinstance(data, dict) or data.get("error"):
         return "", projected
     msg = data.get("message")
-    content = msg.get("content", "") if isinstance(msg, dict) else ""
-    return content or "", projected
+    content = _final_text(msg) if isinstance(msg, dict) else ""
+    return content, projected
 
 
 # ---------------------------------------------------------------- the loop
@@ -489,6 +447,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
     read_progress = {}        # canon path -> next unread byte offset (drives read auto-advance)
     actions = []
     start = time.monotonic()
+    empty_retry_done = False
 
     def stop(reason, final=""):
         nonlocal egress_bytes
@@ -533,7 +492,32 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
         messages.append(msg)                       # assistant turn (may carry tool_calls)
         tcs = msg.get("tool_calls") or []
         if not tcs:
-            return stop("done", final=msg.get("content", ""))
+            final = _final_text(msg)
+            if final or empty_retry_done:
+                return stop("done", final=final)
+            # Empty assistant turn: one same-iteration retry so iters is not incremented
+            # and preflight is not re-run. Charge egress independently.
+            empty_retry_done = True
+            payload2 = _chat_payload(model, messages[:-1], tools, think, NUM_CTX)
+            proj2 = len(json.dumps(payload2, ensure_ascii=False).encode("utf-8"))
+            if egress_bytes + proj2 > EGRESS_BUDGET:
+                return stop("egress_budget")
+            egress_bytes += proj2
+            try:
+                data = _post("/api/chat", payload2,
+                             timeout=max(1, int(timeout_total - (time.monotonic() - start))))
+            except Exception as e:  # noqa: BLE001
+                return stop("api_error:%s" % type(e).__name__)
+            if not isinstance(data, dict):
+                return stop("api_error:non-dict-response")
+            if data.get("error"):
+                return stop("api_error:%s" % str(data["error"])[:120])
+            msg = (data or {}).get("message") or {}
+            messages[-1] = msg                  # replace the empty assistant turn
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                return stop("done", final=_final_text(msg))
+            # retry produced tool_calls: fall through to the preflight/dispatch below
         # preflight the whole turn against the cap so we never partially apply it
         if tool_calls_total + len(tcs) > TOOL_CALL_CAP:
             return stop("tool_call_cap")

@@ -16,6 +16,7 @@ import time
 import unittest
 
 import ollama_agent as oa
+import ollama_companion as oc
 
 
 def _asst(content="", tool_calls=None):
@@ -222,6 +223,23 @@ class LoopTest(unittest.TestCase):
         tool_msgs = [m for m in seq.payloads[1]["messages"] if m.get("role") == "tool"]
         self.assertEqual({m["tool_call_id"] for m in tool_msgs}, {"c1", "c2"})
 
+    def test_empty_turn_retry_yielding_tool_calls_executes_it(self):
+        # An empty assistant turn triggers the A2 same-iteration retry; if the retry returns
+        # tool_calls they must be executed, not dropped with an empty final (regression).
+        with open(os.path.join(self.d, "a.txt"), "w") as f:
+            f.write("hello")
+        seq = _SeqPost([
+            _asst(content=""),                                          # empty turn -> retry
+            _asst(tool_calls=[_call("read_file", {"path": "a.txt"})]),  # retry yields a tool call
+            _asst(content="summary: hello"),                            # final answer
+        ])
+        oa._post = seq
+        r = oa.run_agent("summarize a.txt", self.d)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertEqual(r["final"], "summary: hello")   # not "" -- the retry tool call ran
+        self.assertEqual(len(r["actions"]), 1)
+        self.assertTrue(r["actions"][0]["ok"])
+
     def test_reread_after_write_is_not_auto_advanced(self):
         # read -> write (grows the file) -> read again: the second read must honor offset 0
         # and see the freshly written start, not auto-advance past it on stale read_progress.
@@ -287,12 +305,12 @@ class LoopTest(unittest.TestCase):
 
     def test_detect_context_length_non_dict_response_is_none(self):
         # a valid but wrong-shaped JSON body must not crash the best-effort probe
-        orig = oa._post
-        oa._post = lambda *a, **k: ["not", "a", "dict"]
+        orig = oc._post
+        oc._post = lambda *a, **k: ["not", "a", "dict"]
         try:
-            self.assertIsNone(oa._detect_context_length("x:cloud"))
+            self.assertIsNone(oc._detect_context_length("x:cloud"))
         finally:
-            oa._post = orig
+            oc._post = orig
 
     def test_resolve_num_ctx_env_override_wins(self):
         old = os.environ.get("OLLAMA_CC_NUM_CTX")
@@ -307,12 +325,12 @@ class LoopTest(unittest.TestCase):
     def test_resolve_num_ctx_cloud_detected_is_clamped(self):
         old = os.environ.get("OLLAMA_CC_NUM_CTX")
         os.environ.pop("OLLAMA_CC_NUM_CTX", None)
-        orig = oa._detect_context_length
-        oa._detect_context_length = lambda m: 1_000_000              # a cloud model advertising a 1M window
+        orig = oc._detect_context_length
+        oc._detect_context_length = lambda m: 1_000_000              # a cloud model advertising a 1M window
         try:
-            self.assertEqual(oa._resolve_num_ctx("x:cloud"), oa.NUM_CTX_CEILING)
+            self.assertEqual(oa._resolve_num_ctx("x:cloud"), oc.NUM_CTX_CEILING)
         finally:
-            oa._detect_context_length = orig
+            oc._detect_context_length = orig
             if old is not None:
                 os.environ["OLLAMA_CC_NUM_CTX"] = old
 
@@ -322,12 +340,12 @@ class LoopTest(unittest.TestCase):
             raise AssertionError("garbage env must not reach context detection")
         old = os.environ.get("OLLAMA_CC_NUM_CTX")
         os.environ["OLLAMA_CC_NUM_CTX"] = "32k"
-        orig = oa._detect_context_length
-        oa._detect_context_length = _boom
+        orig = oc._detect_context_length
+        oc._detect_context_length = _boom
         try:
             self.assertEqual(oa._resolve_num_ctx("x:cloud"), 32768)
         finally:
-            oa._detect_context_length = orig
+            oc._detect_context_length = orig
             if old is None:
                 os.environ.pop("OLLAMA_CC_NUM_CTX", None)
             else:
@@ -340,12 +358,12 @@ class LoopTest(unittest.TestCase):
             raise AssertionError("local model must not trigger context detection")
         old = os.environ.get("OLLAMA_CC_NUM_CTX")
         os.environ.pop("OLLAMA_CC_NUM_CTX", None)
-        orig_c, orig_d = oa.is_cloud, oa._detect_context_length
-        oa.is_cloud, oa._detect_context_length = (lambda m: False), _boom
+        orig_c, orig_d = oc.is_cloud, oc._detect_context_length
+        oc.is_cloud, oc._detect_context_length = (lambda m: False), _boom
         try:
             self.assertEqual(oa._resolve_num_ctx("llama3.2:latest"), 32768)
         finally:
-            oa.is_cloud, oa._detect_context_length = orig_c, orig_d
+            oc.is_cloud, oc._detect_context_length = orig_c, orig_d
             if old is not None:
                 os.environ["OLLAMA_CC_NUM_CTX"] = old
 
@@ -509,12 +527,12 @@ class EnvKnobTest(unittest.TestCase):
     def test_int_env_parses_and_falls_back(self):
         name = "OLLAMA_CC_NUM_CTX_TESTONLY"
         os.environ.pop(name, None)
-        self.assertEqual(oa._int_env(name, 32768), 32768)        # unset -> default
+        self.assertEqual(oc._int_env(name, 32768), 32768)        # unset -> default
         os.environ[name] = "8192"
         try:
-            self.assertEqual(oa._int_env(name, 32768), 8192)     # parsed
+            self.assertEqual(oc._int_env(name, 32768), 8192)     # parsed
             os.environ[name] = "not-an-int"
-            self.assertEqual(oa._int_env(name, 32768), 32768)    # unparseable -> default, no crash
+            self.assertEqual(oc._int_env(name, 32768), 32768)    # unparseable -> default, no crash
         finally:
             os.environ.pop(name, None)
 
