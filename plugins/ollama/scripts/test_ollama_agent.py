@@ -614,6 +614,25 @@ class WorktreeTest(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_diff_file_is_byte_exact_for_non_utf8(self):
+        # A non-UTF-8 file's bytes must survive verbatim into diff_file, else `git apply`
+        # fails; _git()'s text decode with errors="replace" would corrupt them to U+FFFD.
+        repo = _init_repo()
+        with open(os.path.join(repo, "latin.txt"), "wb") as f:
+            f.write(b"caf\xe9\n")                        # Latin-1 e-acute = 0xE9, invalid UTF-8
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "latin"], check=True, capture_output=True)
+        # the agent overwrites it -> the diff's removed line carries the raw 0xE9 byte
+        oa._post = _SeqPost([_asst(tool_calls=[_call("write_file", {"path": "latin.txt", "content": "cafe\n"})]),
+                             _asst(content="done")])
+        r = oa.run_agent_in_worktree("edit latin.txt", repo)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertIn("diff_file", r)
+        with open(r["diff_file"], "rb") as f:
+            patch = f.read()
+        self.assertIn(b"\xe9", patch)                    # raw non-UTF-8 byte preserved
+        self.assertNotIn(b"\xef\xbf\xbd", patch)         # NOT the U+FFFD replacement
+
 
 class ShellTest(unittest.TestCase):
     def setUp(self):
@@ -793,15 +812,19 @@ class AsClaudeWorktreeTest(unittest.TestCase):
         # fatal and surfaced (never silently "no changes"), with no diff_file to apply.
         repo = _init_repo()
         oa._launch_claude = lambda *a, **k: {"is_error": False, "session_id": None, "result": "ok"}
-        real_git = oa._git
+        real_run = oa.subprocess.run
 
-        def failing_git(rp, *args, **kw):
-            if args[:1] == ("add",):          # only the diff-capture add fails; worktree setup/removal don't
-                raise oa.GitError("simulated add failure")
-            return real_git(rp, *args, **kw)
+        def failing_run(cmd, *a, **k):
+            # fail only the capture diff (unique --no-textconv); worktree add/remove run real
+            if isinstance(cmd, (list, tuple)) and "--no-textconv" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"boom")
+            return real_run(cmd, *a, **k)
 
-        oa._git = failing_git
-        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        oa.subprocess.run = failing_run
+        try:
+            r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        finally:
+            oa.subprocess.run = real_run
         self.assertTrue(r["is_error"])
         self.assertEqual(r["stop_reason"], "diff_error")
         self.assertIn("diff_error", r)

@@ -670,15 +670,23 @@ def run_agent_in_worktree(task, repo, **kw):
             # agent's work silently vanishes from the diff. check=True on both so a
             # git failure surfaces instead of masquerading as "no changes".
             _git(wt, "add", "-Af", check=True)
-            diff_text = _git(wt, "diff", "--cached", "--binary", check=True).stdout
-            report["diff"] = diff_text
-            if diff_text.strip():
-                # Write the patch to a file OUTSIDE the worktree so the command applies
-                # it by path (`git apply <file>`) and never reconstructs untrusted patch
-                # text through the shell. Survives the worktree cleanup below.
+            # Capture the diff as raw BYTES via a direct subprocess. _git() decodes with
+            # errors="replace", which corrupts a non-UTF-8 file's bytes to U+FFFD so the patch
+            # no longer applies. report["diff"] keeps a lossy-decoded copy for display; diff_file
+            # holds the byte-exact patch the apply gate uses. --no-textconv keeps the raw diff.
+            dr = subprocess.run(["git", "-C", wt, "diff", "--cached", "--binary", "--no-textconv"],
+                                capture_output=True)
+            if dr.returncode != 0:
+                raise GitError("git diff failed: %s" % dr.stderr.decode("utf-8", "replace").strip())
+            diff_bytes = dr.stdout
+            report["diff"] = diff_bytes.decode("utf-8", "replace")
+            if diff_bytes.strip():
+                # Write the patch to a file OUTSIDE the worktree so the command applies it by
+                # path (`git apply <file>`) and never reconstructs untrusted patch text through
+                # the shell. Binary write preserves the bytes; survives the cleanup below.
                 fd, dpath = tempfile.mkstemp(prefix="ollama-diff-", suffix=".patch")
-                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                    f.write(diff_text)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(diff_bytes)
                 report["diff_file"] = dpath
         except GitError as e:
             report["diff_error"] = str(e)
@@ -825,12 +833,12 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
             # diff (index vs the new HEAD) would silently lose committed work. Capture as raw
             # BYTES via a direct subprocess -- _git() decodes utf-8 with errors="replace",
             # which would corrupt a non-UTF-8 file's bytes so the patch no longer applies.
-            # --no-textconv + a timeout guard a hostile session that plants a hanging/slow diff
-            # driver in the worktree (the worktree must still be reaped).
-            # ponytail: `git add` runs without a timeout (its clean filters are rarer); a
-            # session that plants a hanging clean filter can still stall add -- add a timeout
-            # here too if that ever matters.
-            _git(wt, "add", "-Af", check=True)
+            # Both commands run with --no-textconv + a timeout: a hostile session can plant a
+            # hanging/slow clean or diff filter in the worktree, and the worktree must still be
+            # reaped rather than pinned forever.
+            ad = subprocess.run(["git", "-C", wt, "add", "-Af"], capture_output=True, timeout=120)
+            if ad.returncode != 0:
+                raise GitError("git add failed: %s" % ad.stderr.decode("utf-8", "replace").strip())
             dr = subprocess.run(["git", "-C", wt, "diff", "--binary", "--no-textconv", state["base_sha"]],
                                 capture_output=True, timeout=120)
             if dr.returncode != 0:
