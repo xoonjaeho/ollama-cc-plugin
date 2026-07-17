@@ -217,7 +217,10 @@ def cmd_setup(args):
             "Cloud models route through ollama.com; if a cloud call returns an "
             "auth error, run `ollama signin`." if has_cloud else None),
     }, args.json)
-    return 0
+    # rc 1 = daemon reachable but the model list couldn't be fetched (distinct from rc 3 =
+    # daemon unreachable). The review egress gate reads this list and must fail closed when it
+    # is unknown, so a non-zero exit lets a caller detect the degraded result.
+    return 0 if models_error is None else 1
 
 
 def _http_error(e, model):

@@ -321,5 +321,31 @@ class TestMainReconfigure(unittest.TestCase):
         self.assertIn("utf-8", fake_err.encodings)
 
 
+class TestSetupRc(unittest.TestCase):
+    """cmd_setup returns 1 when the daemon is up but the model list can't be fetched (distinct
+    from rc 3 = daemon down), so a caller can detect the degraded result."""
+    def setUp(self):
+        self._orig = oc._get
+
+    def tearDown(self):
+        oc._get = self._orig
+
+    def _run(self):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return oc.cmd_setup(type("A", (), {"json": False})())
+
+    def test_ok_returns_0(self):
+        oc._get = lambda path, timeout=10: {"version": "1"} if "version" in path else {"models": []}
+        self.assertEqual(self._run(), 0)
+
+    def test_tags_failure_returns_1(self):
+        def g(path, timeout=10):
+            if "version" in path:
+                return {"version": "1"}
+            raise urllib.error.URLError("tags unreachable")
+        oc._get = g
+        self.assertEqual(self._run(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
