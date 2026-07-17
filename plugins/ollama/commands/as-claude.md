@@ -1,38 +1,80 @@
 ---
-description: Delegate a task to a FULL Claude Code session powered by an ollama model (ollama launch claude). Full write+shell on your real tree — more dangerous than /ollama:rescue.
-argument-hint: '[--model <name>] [--resume <session-id>] <task>'
-allowed-tools: Bash(ollama:*), Bash(python:*), Bash(py:*), Bash(mktemp:*), Write, AskUserQuestion
+description: Delegate a task to a FULL Claude Code session powered by an ollama model. Default runs in an isolated git worktree with diff-review apply-gate; --no-worktree keeps full direct access.
+argument-hint: '[--model <name>] [--resume <session-id>] [--no-worktree] <task>'
+allowed-tools: Bash(ollama:*), Bash(python:*), Bash(py:*), Bash(git:*), Bash(mktemp:*), Write, AskUserQuestion
 ---
 
-Delegate a task to a **full, real Claude Code session** driven by an ollama model, via `ollama launch claude`. The launched session has Claude Code's entire toolset (Read/Write/Bash/Edit), skills, MCP servers, and hooks — but its "brain" is the ollama model. Unlike `/ollama:ask` (raw model, no tools) and `/ollama:rescue` (isolated worktree, diff reviewed before apply), **this runs with full access on your real working tree and host, with no worktree isolation and no diff-review gate.** Treat every run as arbitrary code execution you are authorizing.
+Delegate a task to a **full, real Claude Code session** driven by an ollama model, via `ollama launch claude`. The launched session has Claude Code's entire toolset (Read/Write/Bash/Edit), skills, MCP servers, and hooks — but its "brain" is the ollama model. **By default this runs in an isolated git worktree off HEAD; you review the diff before it applies to your real tree.** Use `--no-worktree` to run directly on your real tree (no isolation, no diff gate).
 
 Raw arguments:
 $ARGUMENTS
 
-1. **Recursion guard.** If `OLLAMA_AS_CLAUDE_ACTIVE` is already set in the environment (`python -c "import os,sys; sys.exit(0 if os.environ.get('OLLAMA_AS_CLAUDE_ACTIVE') else 1)"` → exit 0 means set), you are already running inside an as-claude session. Refuse and stop, so a launched session cannot spawn another and run away.
+1. **Recursion guard.** If `OLLAMA_AS_CLAUDE_ACTIVE` is already set in the environment (`python -c "import os,sys; sys.exit(0 if os.environ.get('OLLAMA_AS_CLAUDE_ACTIVE') else 1)"` → exit 0 means set), you are already running inside an as-claude session. Refuse and stop.
 
 2. **Resolve model + cloud-ness authoritatively.** Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json`. The model is `--model <name>` if the user gave one, else the JSON's `default_model` (which honors `OLLAMA_CC_MODEL` — never hardcode `glm-5.2:cloud`). **Validate:** the resolved model name MUST appear in the JSON `models` list. If it does not, or `models_error` is set, stop and report — do not launch an unvalidated model name (this both prevents a typo'd model and blocks argument injection through `--model`). Read that model's `cloud` flag from the list; fail closed (treat as cloud) if the model is unlisted.
 
-3. **Validate `--resume`.** If the user passed `--resume <id>`, it MUST match a UUID, case-insensitive: `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. If it does not match, stop. If absent, start a fresh session (no resume). This keeps the id from injecting extra flags.
+3. **Validate `--resume`.** If the user passed `--resume <id>`, it MUST match a UUID, case-insensitive: `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. If it does not match, stop. If absent, start a fresh session. `--resume` forces a **direct** run (not worktree), because `claude --resume` is cwd-scoped and the worktree path is deleted after the run.
 
-4. **Launch gate — disclosure + consent.** Use `AskUserQuestion` exactly once. State plainly, before launching:
-   - This launches a **full Claude Code agent** (all tools, skills, MCP, hooks) powered by the ollama model, run with `--dangerously-skip-permissions`: it can **read, write, delete, and run shell/network commands on your REAL working tree and host, with no per-action approval** — arbitrary code execution.
-   - There is **no worktree isolation and no diff review**; changes land directly. For editing tasks, **`/ollama:rescue` is safer** (isolated worktree, you review the diff before it applies). Prefer rescue unless you specifically need the full Claude Code harness on the ollama brain.
-   - If the model resolved in step 2 is **cloud**, everything the agent reads AND does is exposed to ollama.com — a third party driving an agent on your machine (egress + remote control), not just a read of one file.
-   Options: `Proceed — full-access agent on real tree (RCE)` / `Cancel`. On Cancel, stop.
+4. **Choose mode.**
+   - If `--resume` or `--no-worktree` is present, go to step 6 (direct launch).
+   - Else check `git rev-parse --is-inside-work-tree`. If true, go to step 5 (worktree launch). If false, warn that worktree isolation requires a git repo and fall back to step 6 (direct launch).
 
-5. **Write the task to a temp file with the Write tool** (get a path with `TASKF=$(mktemp)`, then the Write tool puts the task text into it). Never pass the task through a shell argument or heredoc — it is fed to the session on **stdin**, so any shell metacharacters or flag-like text in it cannot break the command or inject flags.
+5. **Worktree launch + apply gate (default).**
+   - **Launch gate — disclosure + consent.** Use `AskUserQuestion` exactly once. State plainly:
+     - This launches a **full Claude Code agent** in an isolated git worktree off HEAD, powered by the ollama model, with `--dangerously-skip-permissions`: it can read, write, delete, and run shell/network commands inside the worktree and on the host.
+     - The worktree is **not a security sandbox**: the launched session's shell/RCE can reach outside the worktree and read/modify/delete/exfiltrate files on this host. Only the repo *state* is protected until you apply the diff.
+     - For editing tasks, `/ollama:rescue` is safer (read-only review, isolated worktree, diff reviewed before apply). Prefer rescue unless you need the full Claude Code harness.
+     - If the model is cloud, everything the agent reads and does is sent to ollama.com — a third party driving an agent on your machine (egress + remote control).
+     Options: `Proceed — worktree isolation, review diff before apply (Recommended)` / `Cancel`. On Cancel, stop.
+   - **Mint task file.** `TASKF=$(mktemp)`. Use the `Write` tool to put the task text into `$TASKF`.
+   - **Delegate to the worktree runtime.** Capture the JSON report to a temp file; do not feed untrusted patch text through stdin or a heredoc later.
+     ```bash
+     REPORTF=$(mktemp)
+     python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_agent.py" --as-claude --repo "<cwd>" --task-file "$TASKF" --model "<validated-model>" > "$REPORTF"
+     ```
+   - **Inspect the report.** Use a surrogate-safe UTF-8 parser to surface key fields for the apply gate:
+     ```bash
+     python -c "import sys, json; sys.stdout.reconfigure(encoding='utf-8', errors='replace'); d=json.load(open(sys.argv[1])); [print(k+':', d.get(k,'')) for k in ('is_error','stop_reason','session_id','base_sha','dirty_base','has_diff','cleanup_error','diff_error','diff_file')]; print('--- result ---'); print(d.get('result',''))" "$REPORTF"
+     ```
+     **Cleanup command** — run it before EVERY stop below (applied, discarded, or error) so the task and patch temp files never linger. It uses only the already-allowed Python tool:
+     ```bash
+     python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if p and os.path.exists(p)]" "$TASKF" "$REPORTF" "$DIFF_FILE"
+     ```
+     - If the report is not valid JSON, or `is_error` is true: show the output, run cleanup, and stop — do not continue to the apply gate. **When `diff_error` is present, be explicit**: the session made changes but the diff could not be captured and the worktree is already removed, so its work is lost — do NOT report "no changes."
+     - If `cleanup_error` is present, mention the leaked worktree path.
+   - **Extract gate variables from the report.** These are paths/IDs generated by the helper, not the untrusted patch text:
+     ```bash
+     DIFF_FILE=$(python -c "import json,sys; print(json.load(sys.stdin).get('diff_file',''))" < "$REPORTF")
+     BASE_SHA=$(python -c "import json,sys; print(json.load(sys.stdin).get('base_sha',''))" < "$REPORTF")
+     HAS_DIFF=$(python -c "import json,sys; print('yes' if json.load(sys.stdin).get('has_diff') else 'no')" < "$REPORTF")
+     DIRTY_BASE=$(python -c "import json,sys; print('yes' if json.load(sys.stdin).get('dirty_base') else 'no')" < "$REPORTF")
+     ```
+   - **Apply gate — never auto-apply.** If `HAS_DIFF` is not `yes`, say there are no changes, run cleanup, and stop. Otherwise show the `result` summary and the diff (`python -c "import sys; print(open(sys.argv[1]).read())" "$DIFF_FILE"`). Use `AskUserQuestion`: `Apply the diff to your working tree` / `Discard`. On Discard, run cleanup and stop.
+   - On Apply, reuse `/ollama:rescue` steps 6–8 (run cleanup before each stop below, too):
+     - If `DIRTY_BASE` is `yes`, warn the user their working tree had uncommitted changes and recommend committing or stashing first, so a failed apply can be cleanly undone.
+     - Check `git rev-parse HEAD` still equals `$BASE_SHA`. If it moved, warn that the diff was built against a different base, run cleanup, and stop.
+     - Dry-run first: `git apply --check --3way "$DIFF_FILE"`. If it fails, show the error, run cleanup, and stop — do not force.
+     - Apply: `git apply --3way "$DIFF_FILE"`.
+     - If apply fails or leaves conflict markers: undo exactly this patch with `git apply --reverse "$DIFF_FILE"`, then remove only the files the patch newly created. **Never run a blanket `git checkout -- .`** — it would destroy the user's own uncommitted work and still miss patch-created files.
+     - Show `git status --short` so the user sees exactly what landed, then run cleanup.
+   - **Do not advertise a resume ID.** A worktree run is throwaway and non-resumable; do not print a `/ollama:as-claude --resume <id>` hint.
 
-6. **Launch and capture the JSON.** The model and resume-id are inserted only after the validation in steps 2–3, so they cannot inject flags. Include `--resume` only if step 3 validated one. **Pipe** the launch stdout into a UTF-8 parser — do **not** redirect it to a file (`> file`); through `ollama launch` the JSON is not reliably captured that way. The parser reconfigures its stdout to UTF-8 so a non-ASCII `result` (e.g. Korean) does not crash on cp949/Windows consoles:
-```bash
-OLLAMA_AS_CLAUDE_ACTIVE=1 ollama launch claude --model "<validated-model>" -- \
-  -p --dangerously-skip-permissions --output-format json [--resume "<validated-id>"] < "$TASKF" 2>/dev/null \
-  | python -c "import sys, json; sys.stdout.reconfigure(encoding='utf-8'); d=json.load(sys.stdin); print(json.dumps({k: d.get(k) for k in ('is_error','session_id','total_cost_usd','result')}, ensure_ascii=False))"
-```
-Remove the task file when done: `rm -f "$TASKF"` (single file — never `rm -rf`).
-
-7. **Report.**
-   - Relay the JSON's `result` verbatim — that is the session's final answer / account of what it did.
-   - Print the `session_id` and tell the user they can continue it: `/ollama:as-claude --resume <session_id> <follow-up>`.
-   - Note once: the JSON's `total_cost_usd` is **Claude Code's own estimate against a placeholder price, not ollama's actual billing** — real usage is governed by your ollama plan.
-   - If `is_error` is true, or the output is not valid JSON, show what came back and stop — do not paper over it.
+6. **Direct launch (`--no-worktree`, `--resume`, or non-git cwd fallback).**
+   - **Launch gate — disclosure + consent.** Use `AskUserQuestion` exactly once. State plainly:
+     - This launches a **full Claude Code agent** (all tools, skills, MCP, hooks) powered by the ollama model, run with `--dangerously-skip-permissions`: it can **read, write, delete, and run shell/network commands on your REAL working tree and host, with no per-action approval** — arbitrary code execution.
+     - There is **no worktree isolation and no diff review**; changes land directly.
+     - If the model is cloud, everything the agent reads AND does is exposed to ollama.com — a third party driving an agent on your machine (egress + remote control).
+     Options: `Proceed — full-access agent on real tree (RCE)` / `Cancel`. On Cancel, stop.
+   - **Mint task file.** `TASKF=$(mktemp)`. Use the `Write` tool to put the task text into `$TASKF`.
+   - **Launch and capture the JSON.** Include `--resume` only if step 3 validated one. Pipe the launch stdout into a UTF-8 parser that is surrogate-safe so a non-ASCII `result` does not crash the report:
+     ```bash
+     OLLAMA_AS_CLAUDE_ACTIVE=1 ollama launch claude --model "<validated-model>" -- \
+       -p --dangerously-skip-permissions --output-format json [--resume "<validated-id>"] < "$TASKF" 2>/dev/null \
+       | python -c "import sys, json; sys.stdout.reconfigure(encoding='utf-8', errors='replace'); d=json.load(sys.stdin); print(json.dumps({k: d.get(k) for k in ('is_error','session_id','total_cost_usd','result')}, ensure_ascii=False))"
+     ```
+   - Remove the task file before returning (including on an error stop), via the already-allowed Python tool: `python -c "import os,sys; p=sys.argv[1]; os.path.exists(p) and os.remove(p)" "$TASKF"`.
+   - **Report.**
+     - Relay the JSON's `result` verbatim — that is the session's final answer / account of what it did.
+     - Print the `session_id` and tell the user they can continue it: `/ollama:as-claude --resume <session_id> <follow-up>`.
+     - Note once: the JSON's `total_cost_usd` is **Claude Code's own estimate against a placeholder price, not ollama's actual billing** — real usage is governed by your ollama plan.
+     - If `is_error` is true, or the output is not valid JSON, show what came back and stop — do not paper over it.

@@ -702,5 +702,143 @@ class GateTokenTest(unittest.TestCase):
         self.assertFalse(oa._consume_gate_token(p))
 
 
+class AsClaudeWorktreeTest(unittest.TestCase):
+    """B1: as-claude worktree isolation, capture, and failure-path safety (launch seam mocked)."""
+
+    def setUp(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        self._orig_launch = oa._launch_claude
+        self._orig_git = oa._git
+        self._orig_post = oa._post
+
+    def tearDown(self):
+        oa._launch_claude = self._orig_launch
+        oa._git = self._orig_git
+        oa._post = self._orig_post
+
+    def _task_file(self, text="do a thing"):
+        tf = os.path.join(tempfile.mkdtemp(), "task.txt")
+        with open(tf, "w", encoding="utf-8") as f:
+            f.write(text)
+        return tf
+
+    def _no_extra_worktree(self, repo):
+        wtlist = subprocess.run(["git", "-C", repo, "worktree", "list"],
+                                capture_output=True, text=True).stdout
+        return wtlist.strip().count("\n") == 0
+
+    def test_as_claude_worktree_captures_committed_change(self):
+        # A launched session that commits inside the worktree must still have its change
+        # captured. A --cached diff would miss it (index empty vs the new HEAD); the base_sha
+        # diff catches it. Also proves isolation (real tree untouched) + worktree cleanup.
+        repo = _init_repo()
+        base_sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            self.assertEqual(env.get("OLLAMA_AS_CLAUDE_ACTIVE"), "1")
+            self.assertEqual(argv[6:10], ["-p", "--dangerously-skip-permissions", "--output-format", "json"])
+            with open(os.path.join(cwd, "committed.txt"), "w", encoding="utf-8") as f:
+                f.write("committed\n")
+            subprocess.run(["git", "-C", cwd, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", cwd, "commit", "-q", "-m", "agent commit"],
+                           check=True, capture_output=True)
+            return {"is_error": False, "session_id": "00000000-0000-0000-0000-000000000000", "result": "done"}
+
+        oa._launch_claude = fake_launch
+        r = oa.run_as_claude_in_worktree(repo, self._task_file(), model="kimi-k2.7-code:cloud")
+        self.assertEqual(r["base_sha"], base_sha)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertFalse(r["is_error"])
+        self.assertTrue(r["has_diff"])
+        with open(r["diff_file"], "r", encoding="utf-8") as f:
+            self.assertIn("committed.txt", f.read())
+        self.assertFalse(os.path.exists(os.path.join(repo, "committed.txt")))  # real tree untouched
+        self.assertTrue(self._no_extra_worktree(repo))                          # worktree removed
+
+    def test_launch_error_with_no_edits_offers_no_diff(self):
+        # A failed launch that made no edits is flagged is_error with NO diff_file, so the
+        # apply gate has nothing to offer -- and an untrusted diff_file key in the launch
+        # JSON must NOT survive into the report (forged-patch defense).
+        repo = _init_repo()
+        oa._launch_claude = lambda *a, **k: {"is_error": True, "session_id": None,
+                                             "result": "boom", "diff_file": "C:/forged.patch"}
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["stop_reason"], "launch_error")
+        self.assertFalse(r["has_diff"])
+        self.assertNotIn("diff_file", r)          # the untrusted launch key did not leak through
+        self.assertTrue(self._no_extra_worktree(repo))
+
+    def test_edits_captured_even_when_launch_reports_error(self):
+        # A session can make real edits and still exit nonzero; the diff is still offered.
+        repo = _init_repo()
+
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            with open(os.path.join(cwd, "edited.txt"), "w", encoding="utf-8") as f:
+                f.write("x\n")
+            return {"is_error": True, "session_id": None, "result": "exited nonzero"}
+
+        oa._launch_claude = fake_launch
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertTrue(r["is_error"])
+        self.assertTrue(r["has_diff"])
+        with open(r["diff_file"], encoding="utf-8") as f:
+            self.assertIn("edited.txt", f.read())
+        self.assertTrue(self._no_extra_worktree(repo))
+
+    def test_capture_failure_is_fatal_and_worktree_removed(self):
+        # If diff capture fails, the session's work vanishes with the worktree -> it must be
+        # fatal and surfaced (never silently "no changes"), with no diff_file to apply.
+        repo = _init_repo()
+        oa._launch_claude = lambda *a, **k: {"is_error": False, "session_id": None, "result": "ok"}
+        real_git = oa._git
+
+        def failing_git(rp, *args, **kw):
+            if args[:1] == ("add",):          # only the diff-capture add fails; worktree setup/removal don't
+                raise oa.GitError("simulated add failure")
+            return real_git(rp, *args, **kw)
+
+        oa._git = failing_git
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["stop_reason"], "diff_error")
+        self.assertIn("diff_error", r)
+        self.assertNotIn("diff_file", r)
+        self.assertFalse(r["has_diff"])
+        self.assertTrue(self._no_extra_worktree(repo))
+
+    def test_cli_rejects_unsafe_as_claude_combos(self):
+        repo = _init_repo()
+        tf = self._task_file()
+        with self.assertRaises(SystemExit):                       # --as-claude needs --repo
+            oa.main(["--as-claude", "--task-file", tf])
+        with self.assertRaises(SystemExit):                       # --as-claude needs --task-file
+            oa.main(["--as-claude", "--repo", repo])
+        with self.assertRaises(SystemExit):                       # --gate-token replayable if left with --as-claude
+            oa.main(["--as-claude", "--repo", repo, "--task-file", tf, "--gate-token", tf])
+        with self.assertRaises(SystemExit):                       # --resume dropped (worktree non-resumable)
+            oa.main(["--as-claude", "--repo", repo, "--task-file", tf,
+                     "--resume", "11111111-1111-1111-1111-111111111111"])
+
+    def test_timeout_kills_the_process_tree(self):
+        # Blocker fix: a launch timeout must kill the WHOLE tree, not just `ollama`. The fake
+        # launch spawns a grandchild that would create a marker after a delay; if the tree is
+        # killed the grandchild dies first and the marker never appears.
+        d = tempfile.mkdtemp()
+        marker = os.path.join(d, "grandchild_ran.txt")
+        grandchild = "import time, sys; time.sleep(2); open(sys.argv[1], 'w').close()"
+        parent = ("import subprocess, sys, time\n"
+                  "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+                  "time.sleep(30)\n")
+        argv = [sys.executable, "-c", parent, grandchild, marker]
+        r = oa._launch_claude(argv, d, self._task_file(), dict(os.environ), timeout=1)
+        self.assertTrue(r["is_error"])
+        self.assertIn("timed out", r["result"])
+        time.sleep(3.5)   # past the grandchild's 2s delay
+        self.assertFalse(os.path.exists(marker), "grandchild survived the process-tree kill")
+
+
 if __name__ == "__main__":
     unittest.main()

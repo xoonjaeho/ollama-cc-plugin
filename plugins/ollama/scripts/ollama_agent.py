@@ -711,22 +711,183 @@ def _consume_gate_token(path):
 
 
 # ---------------------------------------------------------------- CLI
+def _launch_claude(argv, cwd, task_file, env, timeout=TIMEOUT_TOTAL):
+    """Launch `ollama launch claude` with a task on stdin, in its own process group so the
+    WHOLE tree is killed on timeout (a plain subprocess timeout reaps only `ollama`, leaving
+    the `claude` RCE descendant running after we give up). Returns an ALLOWLISTED dict
+    {is_error, result, session_id, returncode} -- never the raw launch JSON, so a
+    model-controlled `result` cannot smuggle gate-owned keys (diff_file, base_sha) into the
+    caller's report. Fail-closed: a nonzero exit or unparseable output => is_error."""
+    try:
+        fh = open(task_file, "r", encoding="utf-8")
+    except OSError as e:
+        return {"is_error": True, "result": "cannot read task file: %s" % e,
+                "session_id": None, "returncode": None}
+    p = None
+    try:
+        try:
+            if os.name == "nt":
+                p = subprocess.Popen(argv, cwd=cwd, stdin=fh, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                     errors="replace", env=env,
+                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                p = subprocess.Popen(argv, cwd=cwd, stdin=fh, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                     errors="replace", env=env, start_new_session=True)
+        except FileNotFoundError as e:
+            return {"is_error": True, "result": "ollama binary not found on PATH: %s" % e,
+                    "session_id": None, "returncode": None}
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(p)              # kill the whole tree, not just the `ollama` parent
+            try:
+                out, err = p.communicate(timeout=5)
+            except Exception:
+                out, err = "", ""
+            return {"is_error": True, "session_id": None, "returncode": None,
+                    "result": "ollama launch claude timed out after %ss (process tree killed)" % timeout}
+    finally:
+        fh.close()
+        if p is not None and p.poll() is None:   # interrupted/errored mid-run -> don't leak the RCE tree
+            _kill_tree(p)
+    rc = p.returncode
+    raw = out or ""
+    data = None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(raw[start:end + 1])
+            except ValueError:
+                data = None
+    if not isinstance(data, dict) or rc != 0:
+        detail = (err or raw or "").strip()[:500] or "no output"
+        sid = data.get("session_id") if isinstance(data, dict) else None
+        return {"is_error": True, "session_id": sid, "returncode": rc,
+                "result": "ollama launch failed (exit %s): %s" % (rc, detail)}
+    return {"is_error": bool(data.get("is_error")), "returncode": rc,
+            "result": data.get("result") or "", "session_id": data.get("session_id")}
+
+
+def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT_TOTAL):
+    """Launch a full Claude Code session inside an isolated worktree off HEAD, then capture
+    its changes as a patch the caller can review and apply. The worktree is ALWAYS removed.
+    The returned report is built here (not from the untrusted launch JSON); a diff is offered
+    only when git capture actually produced one, independently of the launch's exit status
+    (a session that exited nonzero may still have made edits worth reviewing)."""
+    repo = os.path.realpath(repo)
+    try:
+        state = _git_state(repo)
+    except GitError as e:
+        return {"stop_reason": "precondition", "error": str(e)}
+    try:
+        wt = _make_worktree(repo, state["base_sha"])
+    except Exception as e:
+        return {"stop_reason": "worktree_error", "error": str(e), "base_sha": state["base_sha"]}
+    # A fresh report we own end-to-end: only result/session_id are copied from the launch.
+    report = {"is_error": False, "stop_reason": "done", "result": "", "session_id": None,
+              "has_diff": False, "base_sha": state["base_sha"],
+              "dirty_base": state["dirty"], "detached": state["detached"]}
+    cleanup_error = None
+    try:
+        # Defense in depth: tell the launched session not to commit in the worktree. Even if
+        # it does, the base_sha diff below still captures the change.
+        with open(task_file, "r", encoding="utf-8") as f:
+            original_task = f.read()
+        fd, wrapped_task = tempfile.mkstemp(prefix="ollama-as-claude-task-", suffix=".txt")
+        try:  # create+launch inside try/finally so a write failure can't leak wrapped_task
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write("You are working in a temporary git worktree. Do NOT run git commit here. "
+                        "Make file edits, then finish; the user will review and apply your changes separately.\n\n")
+                f.write(original_task)
+            argv = ["ollama", "launch", "claude", "--model", model or DEFAULT_MODEL, "--",
+                    "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+            env = dict(os.environ)
+            env["OLLAMA_AS_CLAUDE_ACTIVE"] = "1"
+            launch = _launch_claude(argv, wt, wrapped_task, env, timeout=timeout_total)
+        finally:
+            try:
+                os.remove(wrapped_task)
+            except OSError:
+                pass
+        report["result"] = launch.get("result", "")
+        report["session_id"] = launch.get("session_id")
+        if launch.get("is_error"):
+            report["is_error"] = True
+            report["stop_reason"] = "launch_error"
+        try:
+            # -Af captures all writes (incl. gitignored). Diff against the captured base_sha,
+            # NOT --cached: the launched session may commit inside the worktree, and a --cached
+            # diff (index vs the new HEAD) would silently lose committed work. Capture as raw
+            # BYTES via a direct subprocess -- _git() decodes utf-8 with errors="replace",
+            # which would corrupt a non-UTF-8 file's bytes so the patch no longer applies.
+            # --no-textconv + a timeout guard a hostile session that plants a hanging/slow diff
+            # driver in the worktree (the worktree must still be reaped).
+            # ponytail: `git add` runs without a timeout (its clean filters are rarer); a
+            # session that plants a hanging clean filter can still stall add -- add a timeout
+            # here too if that ever matters.
+            _git(wt, "add", "-Af", check=True)
+            dr = subprocess.run(["git", "-C", wt, "diff", "--binary", "--no-textconv", state["base_sha"]],
+                                capture_output=True, timeout=120)
+            if dr.returncode != 0:
+                raise GitError("git diff failed: %s" % dr.stderr.decode("utf-8", "replace").strip())
+            diff_bytes = dr.stdout
+        except (GitError, subprocess.TimeoutExpired) as e:
+            # Capture failed/hung and the worktree is about to be removed -> the work is gone.
+            # Fail loudly so the caller never reports "no changes"; offer nothing to apply.
+            report["is_error"] = True
+            report["stop_reason"] = "diff_error"
+            report["diff_error"] = str(e) or "git capture timed out"
+            report.pop("diff_file", None)
+        else:
+            if diff_bytes.strip():
+                dpath = None
+                try:
+                    fd, dpath = tempfile.mkstemp(prefix="ollama-as-claude-diff-", suffix=".patch")
+                    with os.fdopen(fd, "wb") as f:   # binary: preserve patch bytes verbatim
+                        f.write(diff_bytes)
+                    report["diff_file"] = dpath
+                    report["has_diff"] = True
+                except OSError as e:                 # e.g. temp volume full: don't lose the work silently
+                    if dpath and os.path.exists(dpath):
+                        try:
+                            os.remove(dpath)
+                        except OSError:
+                            pass
+                    report["is_error"] = True
+                    report["stop_reason"] = "diff_error"
+                    report["diff_error"] = "could not write patch file: %s" % e
+    finally:
+        removed = _remove_worktree(repo, wt)
+        if not removed:
+            cleanup_error = "worktree not removed (may be locked): %s" % wt
+    if cleanup_error:
+        report["cleanup_error"] = cleanup_error
+    return report
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             try:
-                reconfigure(encoding="utf-8")
+                reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
     p = argparse.ArgumentParser(prog="ollama_agent")
     p.add_argument("task", nargs="?", default=None, help="task text (or via stdin)")
-    where = p.add_mutually_exclusive_group(required=True)
+    where = p.add_mutually_exclusive_group(required=False)
     where.add_argument("--repo", help="git repo: run in an isolated worktree off HEAD, return a diff (P2)")
     where.add_argument("--root", help="jailed working root operated on directly (scratch/testing only)")
     p.add_argument("--gate-token", help="path to the single-use launch-gate token minted by /ollama:rescue")
     p.add_argument("--task-file", help="read the task from this file (avoids putting untrusted text on the command line)")
     p.add_argument("--model", default=None)
+    p.add_argument("--as-claude", action="store_true",
+                   help="as-claude mode: launch a real Claude session in a worktree (no gate token)")
     p.add_argument("--think", action="store_true")
     p.add_argument("--allow-shell", action="store_true",
                    help="DANGER: give the agent a run_shell tool -- full RCE, not contained by the worktree")
@@ -735,6 +896,18 @@ def main(argv=None):
     p.add_argument("--max-iters", type=int, default=MAX_ITERS)
     p.add_argument("--timeout", type=int, default=TIMEOUT_TOTAL)
     args = p.parse_args(argv)
+    if args.as_claude:
+        if not args.repo:
+            p.error("--as-claude requires --repo")
+        if not args.task_file:
+            p.error("--as-claude requires --task-file")
+    elif not args.repo and not args.root:
+        p.error("one of --repo or --root is required")
+    if args.gate_token is not None:   # the single-use rescue token is only meaningful for a plain --repo run
+        if args.as_claude:
+            p.error("--gate-token is not used with --as-claude")
+        if not args.repo:
+            p.error("--gate-token requires --repo")
     # Size the context window (and the derived read cap) to the chosen model before running:
     # an explicit OLLAMA_CC_NUM_CTX wins, else a cloud model auto-sizes to its real window.
     global NUM_CTX, CTX_CHAR_BUDGET, READ_CAP
@@ -754,7 +927,10 @@ def main(argv=None):
     kw = dict(model=args.model, think=args.think,
               allow_write=not args.readonly, allow_shell=args.allow_shell and not args.readonly,
               max_iters=args.max_iters, timeout_total=args.timeout)
-    if args.repo:
+    if args.as_claude:
+        report = run_as_claude_in_worktree(args.repo, args.task_file, model=args.model,
+                                           timeout_total=args.timeout)
+    elif args.repo:
         # the write-capable agent is fail-closed behind the launch gate's token
         if not _consume_gate_token(args.gate_token):
             print("error: refused -- no valid launch token. Start the write-capable agent via "
