@@ -1,6 +1,6 @@
 {
   "name": "ollama",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Use ollama models as a second engine: read-only consult/review, plus an agentic rescue that edits files in an isolated git worktree for you to review.",
   "author": {
     "name": "xoonjaeho"
