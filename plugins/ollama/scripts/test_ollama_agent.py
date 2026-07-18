@@ -368,6 +368,94 @@ class LoopTest(unittest.TestCase):
                 os.environ["OLLAMA_CC_NUM_CTX"] = old
 
 
+class IdleGapTimeoutTest(unittest.TestCase):
+    """readonly (adversarial-review) uses idle-gap timeout: each call gets the full window,
+    no whole-run cap -- so a steadily-progressing review is not killed mid-flight (max_iters
+    stays the backstop). A write run keeps the hard total cap. Catches the regression in both
+    directions: idle_gap leaking to the write path (rescue loses its cap) or missing on the
+    readonly path (review dies while still making progress)."""
+
+    def setUp(self):
+        self._orig_post = oa._post
+        self._orig_time = oa.time
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        oa._post, oa.time = self._orig_post, self._orig_time
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _jump_clock(self):
+        """A fake clock that only advances when _post is called (below), so wall time is
+        driven deterministically by the loop. Unknown attrs forward to the real time module."""
+        real = self._orig_time
+
+        class _C:
+            t = 1000.0
+
+            def monotonic(self):
+                return self.t
+
+            def __getattr__(self, n):
+                return getattr(real, n)
+        c = _C()
+        oa.time = c
+        return c
+
+    def _advancing(self, clock, step=100000.0):
+        """_post stub that jumps the clock far past any total cap on every call and asks for a
+        fresh (non-repeating) read, so only a timeout / max_iters bound can stop the loop."""
+        n = [0]
+
+        def post(path, payload, timeout=None):
+            clock.t += step
+            n[0] += 1
+            return _asst(tool_calls=[_call("read_file", {"path": "f%d.txt" % n[0]})])
+        return post
+
+    def test_readonly_idle_gap_has_no_total_cap(self):
+        clock = self._jump_clock()
+        oa._post = self._advancing(clock)
+        r = oa.run_agent("x", self.d, max_iters=3, timeout_total=300, idle_gap=True)
+        self.assertEqual(r["stop_reason"], "max_iters")   # NOT "timeout"
+
+    def test_readonly_idle_gap_uses_fixed_per_call_timeout(self):
+        # Even with the clock jumped far past the window, each call is given the full window as
+        # its (idle) timeout -- never a shrunk-to-1 remainder.
+        clock = self._jump_clock()
+        with open(os.path.join(self.d, "a.txt"), "w") as f:
+            f.write("hi")
+        seen = []
+        seq = [_asst(tool_calls=[_call("read_file", {"path": "a.txt"})]), _asst(content="ok")]
+
+        def post(path, payload, timeout=None):
+            clock.t += 100000.0
+            seen.append(timeout)
+            return seq.pop(0)
+        oa._post = post
+        r = oa.run_agent("x", self.d, timeout_total=300, idle_gap=True)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertEqual(seen, [300, 300])
+
+    def test_write_path_keeps_total_cap(self):
+        clock = self._jump_clock()
+        oa._post = self._advancing(clock)
+        r = oa.run_agent("x", self.d, max_iters=99, timeout_total=300)  # idle_gap default False
+        self.assertEqual(r["stop_reason"], "timeout")
+
+    def test_readonly_idle_gap_floors_nonsensical_timeout(self):
+        # A user-supplied --timeout of 0/negative must not reach the socket as-is (0 -> a
+        # nonblocking socket). The idle-gap branch floors it at 1 like the write branch.
+        seen = []
+        seq = [_asst(content="ok")]
+
+        def post(path, payload, timeout=None):
+            seen.append(timeout)
+            return seq.pop(0)
+        oa._post = post
+        oa.run_agent("x", self.d, timeout_total=0, idle_gap=True)
+        self.assertTrue(seen and all(t >= 1 for t in seen))
+
+
 class FallbackTest(unittest.TestCase):
     def setUp(self):
         self._orig = oa._post

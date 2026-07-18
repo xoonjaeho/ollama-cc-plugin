@@ -1,6 +1,6 @@
 ---
 description: Delegate a coding task to an ollama-model agent that edits files in an isolated worktree; review its diff before it touches your tree
-argument-hint: '[--model <name>] [--allow-shell] <what the ollama agent should do>'
+argument-hint: '[--model <name>] [--allow-shell] [--timeout <sec>] <what the ollama agent should do>'
 allowed-tools: Bash(python:*), Bash(py:*), Bash(git:*), Bash(mktemp:*), Write, AskUserQuestion, Agent
 ---
 
@@ -9,7 +9,7 @@ Delegate a task to the ollama agent. It reads and writes files in an **isolated 
 Raw arguments:
 $ARGUMENTS
 
-1. Repo = current working directory. Verify it is a git work tree (`git rev-parse --is-inside-work-tree`); if not, tell the user `/ollama:rescue` needs a git repo and stop. **Resolve the model and its cloud-ness authoritatively** — run `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json`: the model is `--model <name>` if given, else the JSON's `default_model` (which honors `OLLAMA_CC_MODEL` — do NOT hard-code `glm-5.2:cloud`, or a user who set a local default gets a false cloud warning). Read that model's `cloud` flag from the JSON `models` list; fail closed (treat as cloud) if the model is not listed or `models_error` is set.
+1. Repo = current working directory. Recognize `--timeout <sec>` as a flag (default `1800`, a whole-run wall-clock cap since a rescue writes files), not part of the task text. Verify it is a git work tree (`git rev-parse --is-inside-work-tree`); if not, tell the user `/ollama:rescue` needs a git repo and stop. **Resolve the model and its cloud-ness authoritatively** — run `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json`: the model is `--model <name>` if given, else the JSON's `default_model` (which honors `OLLAMA_CC_MODEL` — do NOT hard-code `glm-5.2:cloud`, or a user who set a local default gets a false cloud warning). Read that model's `cloud` flag from the JSON `models` list; fail closed (treat as cloud) if the model is not listed or `models_error` is set.
 
 2. **Launch gate — disclosure + consent.** Use `AskUserQuestion` exactly once. State plainly, before delegating:
    - the ollama agent will read and write files in an isolated worktree off HEAD, and you will review its diff before anything is applied;
@@ -24,7 +24,7 @@ TOK=$(mktemp); python -c "import secrets,sys; open(sys.argv[1],'w').write(secret
 ```
    - **Write the user's task to a temp file using the Write tool** (get a path with `TASKF=$(mktemp)`, then the Write tool puts the task text into it). Do this with the Write tool, never `echo`/shell — the task is untrusted and must not pass through a shell command.
 
-4. **Delegate** to the `ollama:ollama-rescue` subagent via the `Agent` tool (`subagent_type: "ollama:ollama-rescue"`). Give it in the prompt ONLY these paths, on separate lines: `repo: <cwd>`, `token: <$TOK>`, `task_file: <$TASKF>`, `model: <name>` only if the user specified one, and `allow_shell: true` only if the raw arguments contained `--allow-shell` and the user confirmed the shell/RCE disclosure. **Never put the task text itself into the prompt — only its file path.** The subagent runs the runtime once and returns a JSON report. Do not do the run yourself.
+4. **Delegate** to the `ollama:ollama-rescue` subagent via the `Agent` tool (`subagent_type: "ollama:ollama-rescue"`). Give it in the prompt ONLY these paths, on separate lines: `repo: <cwd>`, `token: <$TOK>`, `task_file: <$TASKF>`, `timeout: <sec>` (the value parsed in step 1, else `1800`), `model: <name>` only if the user specified one, and `allow_shell: true` only if the raw arguments contained `--allow-shell` and the user confirmed the shell/RCE disclosure. **Never put the task text itself into the prompt — only its file path.** The subagent runs the runtime once and returns a JSON report. Do not do the run yourself.
 
 5. Present the report's `final` summary and its `diff`. If `stop_reason` is not `done`, or the `diff` is empty, say so and stop — there is nothing to apply. If `cleanup_error` is present, mention the leaked worktree path.
 

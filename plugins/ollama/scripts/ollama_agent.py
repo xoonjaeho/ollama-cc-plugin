@@ -432,7 +432,7 @@ def _append_tool(messages, tool_call_id, name, content):
 
 
 def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell=False,
-              max_iters=MAX_ITERS, timeout_total=TIMEOUT_TOTAL):
+              max_iters=MAX_ITERS, timeout_total=TIMEOUT_TOTAL, idle_gap=False):
     model = model or DEFAULT_MODEL
     tools, dispatch = _toolset(allow_write=allow_write, allow_shell=allow_shell)
     root_real = os.path.realpath(root)
@@ -449,6 +449,15 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
     start = time.monotonic()
     empty_retry_done = False
 
+    def _req_timeout():
+        # idle_gap (readonly adversarial-review): each call gets the full window as an idle
+        # timeout -- matching /review's stream semantics, a steadily-progressing review is not
+        # killed by a whole-run cap (max_iters/egress stay the runaway backstops). A write run
+        # keeps a hard total budget that shrinks per call.
+        if idle_gap:
+            return max(1, int(timeout_total))   # floor a nonsensical --timeout <=0 like the write branch
+        return max(1, int(timeout_total - (time.monotonic() - start)))
+
     def stop(reason, final=""):
         nonlocal egress_bytes
         if not final and reason in _SYNTH_STOPS:
@@ -458,7 +467,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             _truncate_history(messages, pinned)
             final, spent = _force_synthesis(
                 messages, model, think, NUM_CTX,
-                timeout_total - (time.monotonic() - start),
+                timeout_total if idle_gap else timeout_total - (time.monotonic() - start),
                 EGRESS_BUDGET - egress_bytes)
             egress_bytes += spent
         return {"stop_reason": reason, "iterations": iters, "final": final,
@@ -470,7 +479,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
         if iters > max_iters:
             return stop("max_iters")
         elapsed = time.monotonic() - start
-        if elapsed > timeout_total:
+        if not idle_gap and elapsed > timeout_total:
             return stop("timeout")
         _truncate_history(messages, pinned)
         payload = _chat_payload(model, messages, tools, think, NUM_CTX)
@@ -479,9 +488,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             return stop("egress_budget")
         egress_bytes += projected
         try:
-            # per-request timeout bounded by the remaining total, so a late call
-            # cannot block for another full window.
-            data = _post("/api/chat", payload, timeout=max(1, int(timeout_total - elapsed)))
+            data = _post("/api/chat", payload, timeout=_req_timeout())
         except Exception as e:  # noqa: BLE001 - surface any transport/parse failure as a stop
             return stop("api_error:%s" % type(e).__name__)
         if not isinstance(data, dict):
@@ -504,8 +511,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                 return stop("egress_budget")
             egress_bytes += proj2
             try:
-                data = _post("/api/chat", payload2,
-                             timeout=max(1, int(timeout_total - (time.monotonic() - start))))
+                data = _post("/api/chat", payload2, timeout=_req_timeout())
             except Exception as e:  # noqa: BLE001
                 return stop("api_error:%s" % type(e).__name__)
             if not isinstance(data, dict):
@@ -947,7 +953,9 @@ def main(argv=None):
             return 5
         report = run_agent_in_worktree(task.strip(), args.repo, **kw)
     else:
-        report = run_agent(task.strip(), args.root, **kw)
+        # readonly (adversarial-review): idle-gap timeout, no whole-run cap. A --root write run
+        # (scratch/testing) keeps the hard total cap.
+        report = run_agent(task.strip(), args.root, idle_gap=args.readonly, **kw)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("stop_reason") == "done" else 1
 

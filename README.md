@@ -9,21 +9,27 @@ Two tiers:
 
 ## What you get
 
-| Command | Tier | What it does |
-|---|---|---|
-| `/ollama:setup` | — | check the daemon, list models, flag cloud sign-in |
-| `/ollama:ask` | read-only | ask a model a question, answer returned verbatim |
-| `/ollama:review` | read-only | review your git changes with a model (cloud egress gated) |
-| `/ollama:adversarial-review` | read-only | a model **explores** your repo (read/list/grep) and challenges it; steerable focus |
-| `/ollama:rescue` | **agentic** | delegate a coding task; the model edits files in an isolated worktree → you review the diff before it applies |
-| `/ollama:as-claude` | **full session** | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — full write+shell on your real tree, **no worktree, no diff gate**. More dangerous than rescue |
-| `/ollama:list` | read-only | list installed / available models |
-| `/ollama:ps` | read-only | list running (in-memory) models |
-| `/ollama:show` | read-only | show a model's details (family, parameters, quantization, size) |
-| `/ollama:pull` | manage | download/install a model — **confirms before the download** |
-| `/ollama:rm` | manage | delete an installed model — **confirms before deleting** |
-| `/ollama:usage` | read-only | show your ollama.com **cloud usage** (session + weekly %) |
-| `/ollama:usage-login` | setup | capture your ollama.com session via a one-time browser login (optional; needs Playwright) |
+| Command | Tier | Engine | Timeout | Cloud egress | What it does |
+|---|---|---|---|---|---|
+| `/ollama:setup` | — | companion | — | none | check the daemon, list models, flag cloud sign-in |
+| `/ollama:ask` | read-only | companion | 5 min · idle-gap | question sent (disclosed) | ask a model a question, answer returned verbatim |
+| `/ollama:review` | read-only | companion | 5 min · idle-gap | diff sent (gated) | review your git changes with a model (cloud egress gated) |
+| `/ollama:adversarial-review` | read-only | agent | 5 min · idle-gap | reads sent (gated) | a model **explores** your repo (read/list/grep) and challenges it; steerable focus |
+| `/ollama:rescue` | **agentic** | agent | 30 min · total | reads sent (gated) | delegate a coding task; the model edits files in an isolated worktree → you review the diff before it applies |
+| `/ollama:as-claude` | **full session** | agent → claude | 30 min · total\* | reads + actions (gated) | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — full write+shell on your real tree, **no worktree, no diff gate**. More dangerous than rescue |
+| `/ollama:list` | read-only | companion | — | none | list installed / available models |
+| `/ollama:ps` | read-only | companion | — | none | list running (in-memory) models |
+| `/ollama:show` | read-only | companion | — | none | show a model's details (family, parameters, quantization, size) |
+| `/ollama:pull` | manage | companion | — | none (downloads) | download/install a model — **confirms before the download** |
+| `/ollama:rm` | manage | companion | — | none | delete an installed model — **confirms before deleting** |
+| `/ollama:usage` | read-only | usage | — | cookie → ollama.com | show your ollama.com **cloud usage** (session + weekly %) |
+| `/ollama:usage-login` | setup | usage | — | login → ollama.com | capture your ollama.com session via a one-time browser login (optional; needs Playwright) |
+
+**Engine** — `companion` = a single stateless daemon call (`ollama_companion.py`); `agent` = the tool loop in a jailed root / worktree (`ollama_agent.py`); `agent → claude` = the agent launches a real Claude Code session; `usage` = the cloud-usage reader.
+
+**Timeout** — the five working commands accept `--timeout <sec>` to override the default. `idle-gap` = the longest quiet gap allowed (a steadily-progressing run keeps going; only a real stall is killed), so a long review completes as long as it makes progress. `total` = a hard wall-clock cap on the whole run (its process tree is killed past it), used where the command writes files. `*` as-claude's cap applies to the default worktree launch; a `--no-worktree` / `--resume` run is unbounded. The other commands are quick local daemon calls with no user-facing timeout.
+
+**Cloud egress** applies **only when the model is a cloud model** (name contains `cloud`); with a local model nothing leaves the machine. `gated` = asks for consent before sending; `disclosed` = proceeds but tells you it went to the cloud. `usage`/`usage-login` talk to `ollama.com` regardless of model (that's where the numbers live).
 
 ## Requirements
 

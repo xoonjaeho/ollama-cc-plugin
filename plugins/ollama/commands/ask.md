@@ -1,6 +1,6 @@
 ---
 description: Ask an ollama model a question and return its answer verbatim (read-only second opinion)
-argument-hint: '[--model <name>] <your question>'
+argument-hint: '[--model <name>] [--timeout <sec>] <your question>'
 allowed-tools: Bash(python:*), Bash(py:*), Bash(mktemp:*), Write
 ---
 
@@ -12,10 +12,10 @@ $ARGUMENTS
 Steps:
 
 - Send **only what the user gave you** (their question, plus anything they explicitly pasted). Do **not** read, grep, or gather repository files into the prompt — that would silently ship repo code to the model (and, for a cloud model, off-machine). If answering clearly needs repo context, either ask the user to paste the relevant snippet, or point them to `/ollama:review` (which gates cloud egress). This is why this command is not granted `Read`/`Grep`/`Glob`.
-- Write the question to a temp file with the **Write tool** (`QF=$(mktemp)`, then the Write tool puts the question into it), and feed it on stdin. Do **not** use a heredoc — a question that happens to contain the terminator line would truncate the input early; a file avoids that class of bug entirely. Use `py -3` if `python` is missing. Preserve `--model` if the user gave one; otherwise the runtime uses its configured default:
+- Write the question to a temp file with the **Write tool** (`QF=$(mktemp)`, then the Write tool puts the question into it), and feed it on stdin. Do **not** use a heredoc — a question that happens to contain the terminator line would truncate the input early; a file avoids that class of bug entirely. Use `py -3` if `python` is missing. Preserve `--model` if the user gave one; otherwise the runtime uses its configured default. Parse `--timeout <sec>` from the raw arguments if present, else default to `300`; it is a flag, not part of the question, so do not put it in `$QF`. The answer is streamed (`--stream`), so `--timeout` is the max idle gap between tokens (a hang detector), not a total cap — a long-but-progressing answer completes as long as tokens keep arriving:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" run [--model <name>] < "$QF"
+python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" run [--model <name>] --stream --timeout <sec> < "$QF"
 ```
 
 Remove `$QF` when done.

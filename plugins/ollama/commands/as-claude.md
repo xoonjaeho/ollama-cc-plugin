@@ -1,6 +1,6 @@
 ---
 description: Delegate a task to a FULL Claude Code session powered by an ollama model. Default runs in an isolated git worktree with diff-review apply-gate; --no-worktree keeps full direct access.
-argument-hint: '[--model <name>] [--resume <session-id>] [--no-worktree] <task>'
+argument-hint: '[--model <name>] [--resume <session-id>] [--no-worktree] [--timeout <sec>] <task>'
 allowed-tools: Bash(ollama:*), Bash(python:*), Bash(py:*), Bash(git:*), Bash(mktemp:*), Write, AskUserQuestion
 ---
 
@@ -11,7 +11,7 @@ $ARGUMENTS
 
 1. **Recursion guard.** If `OLLAMA_AS_CLAUDE_ACTIVE` is already set in the environment (`python -c "import os,sys; sys.exit(0 if os.environ.get('OLLAMA_AS_CLAUDE_ACTIVE') else 1)"` → exit 0 means set), you are already running inside an as-claude session. Refuse and stop.
 
-2. **Resolve model + cloud-ness authoritatively.** Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json`. The model is `--model <name>` if the user gave one, else the JSON's `default_model` (which honors `OLLAMA_CC_MODEL` — never hardcode `glm-5.2:cloud`). **Validate:** the resolved model name MUST appear in the JSON `models` list. If it does not, or `models_error` is set, stop and report — do not launch an unvalidated model name (this both prevents a typo'd model and blocks argument injection through `--model`). Read that model's `cloud` flag from the list; fail closed (treat as cloud) if the model is unlisted.
+2. **Resolve model + cloud-ness authoritatively.** Recognize `--timeout <sec>` as a flag (default `1800`, a whole-run wall-clock cap), not part of the task text; it bounds the worktree launch (step 5). Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json`. The model is `--model <name>` if the user gave one, else the JSON's `default_model` (which honors `OLLAMA_CC_MODEL` — never hardcode `glm-5.2:cloud`). **Validate:** the resolved model name MUST appear in the JSON `models` list. If it does not, or `models_error` is set, stop and report — do not launch an unvalidated model name (this both prevents a typo'd model and blocks argument injection through `--model`). Read that model's `cloud` flag from the list; fail closed (treat as cloud) if the model is unlisted.
 
 3. **Validate `--resume`.** If the user passed `--resume <id>`, it MUST match a UUID, case-insensitive: `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. If it does not match, stop. If absent, start a fresh session. `--resume` forces a **direct** run (not worktree), because `claude --resume` is cwd-scoped and the worktree path is deleted after the run.
 
@@ -28,9 +28,10 @@ $ARGUMENTS
      Options: `Proceed — worktree isolation, review diff before apply (Recommended)` / `Cancel`. On Cancel, stop.
    - **Mint task file.** `TASKF=$(mktemp)`. Use the `Write` tool to put the task text into `$TASKF`.
    - **Delegate to the worktree runtime.** Capture the JSON report to a temp file; do not feed untrusted patch text through stdin or a heredoc later.
+     Use the `--timeout <sec>` parsed in step 2 (else `1800`); it is a hard wall-clock cap — the launched session's whole process tree is killed if it runs past it.
      ```bash
      REPORTF=$(mktemp)
-     python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_agent.py" --as-claude --repo "<cwd>" --task-file "$TASKF" --model "<validated-model>" > "$REPORTF"
+     python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_agent.py" --as-claude --repo "<cwd>" --task-file "$TASKF" --model "<validated-model>" --timeout <sec> > "$REPORTF"
      ```
    - **Inspect the report.** Use a surrogate-safe UTF-8 parser to surface key fields:
      ```bash
@@ -63,7 +64,7 @@ $ARGUMENTS
      - Show `git status --short` so the user sees exactly what landed, then run cleanup.
    - **Do not advertise a resume ID.** A worktree run is throwaway and non-resumable; do not print a `/ollama:as-claude --resume <id>` hint.
 
-6. **Direct launch (`--no-worktree`, `--resume`, or non-git cwd fallback).**
+6. **Direct launch (`--no-worktree`, `--resume`, or non-git cwd fallback).** `--timeout` is not enforced on this path — the session runs unbounded in the foreground; if the user set `--timeout`, tell them it applies only to the default worktree launch (step 5).
    - **Launch gate — disclosure + consent.** Use `AskUserQuestion` exactly once. State plainly:
      - This launches a **full Claude Code agent** (all tools, skills, MCP, hooks) powered by the ollama model, run with `--dangerously-skip-permissions`: it can **read, write, delete, and run shell/network commands on your REAL working tree and host, with no per-action approval** — arbitrary code execution.
      - There is **no worktree isolation and no diff review**; changes land directly.
