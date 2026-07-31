@@ -16,7 +16,7 @@ Two tiers:
 | `/ollama:review` | read-only | companion | 5 min · idle-gap | diff sent (gated) | review your git changes with a model (cloud egress gated) |
 | `/ollama:adversarial-review` | read-only | agent | 5 min · idle-gap | reads sent (gated) | a model **explores** your repo (read/list/grep) and challenges it; steerable focus |
 | `/ollama:rescue` | **agentic** | agent | 30 min · total | reads sent (gated) | delegate a coding task; the model edits files in an isolated worktree → you review the diff before it applies |
-| `/ollama:as-claude` | **full session** | agent → claude | 30 min · total\* | reads + actions (disclosed) | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — full write+shell on your real tree, **no worktree, no diff gate**. More dangerous than rescue |
+| `/ollama:as-claude` | **full session** | agent → claude | 30 min · total\* | reads + actions (disclosed) | run a task in a *real* Claude Code session powered by an ollama model (`ollama launch claude`) — isolated worktree + diff apply-gate by default, `--no-worktree` / `--resume` write straight to your real tree. Full host shell either way — more dangerous than rescue |
 | `/ollama:list` | read-only | companion | — | none | list installed / available models |
 | `/ollama:ps` | read-only | companion | — | none | list running (in-memory) models |
 | `/ollama:show` | read-only | companion | — | none | show a model's details (family, parameters, quantization, size) |
@@ -87,7 +87,7 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 - **It launches without asking.** There is no consent prompt — typing the command starts the agent. The diff apply-gate guards the repo's *git state*, not the host: the session's shell reaches outside the worktree and can write to your real checkout by absolute path before you are asked to apply. A `--no-worktree` / `--resume` run has no gate at all.
 - **Full host access by default.** The session runs with `--dangerously-skip-permissions` — it can read, write, delete, and run shell/network commands with no per-action approval. Pass `--permission-mode <acceptEdits|auto|bypassPermissions|default|dontAsk|plan>` to change that; `bypassPermissions` is the default. Note that under `auto` the classifier is the **same ollama model** judging its own tool calls, and in headless mode a blocked call is denied while the session keeps going — so a run can come back partially done. For edits you want to review before they land, use `/ollama:rescue` instead (worktree-isolated).
 - **Cloud egress + remote control.** With a cloud model, everything the session reads *and does* is exposed to `ollama.com` — a third party driving a full agent on your machine. The command tells you; it does not ask.
-- **Continue a session** with `--resume <session-id>` (printed after each run); override the model with `--model <name>`.
+- **Continue a session** with `--resume <session-id>` — printed only after a `--no-worktree` / `--resume` run; a worktree run is throwaway and non-resumable, so it prints none. Override the model with `--model <name>`.
 - The `total_cost_usd` the session reports is Claude Code's own placeholder estimate, **not** ollama's billing.
 
 ## Model management
