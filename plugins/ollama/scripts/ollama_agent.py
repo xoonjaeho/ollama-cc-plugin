@@ -44,7 +44,7 @@ from ollama_companion import (  # noqa: E402
 WRITE_CAP = 1024 * 1024       # 1 MiB per write_file: ample for source, caps a runaway model from filling the worktree disk before review
 EGRESS_BUDGET = 8 * 1024 * 1024
 MAX_ITERS = 15
-TIMEOUT_TOTAL = 300           # seconds, whole run
+TIMEOUT_TOTAL = 900           # seconds, whole run
 TOOL_CALL_CAP = 40
 MALFORMED_CAP = 3
 LOOP_REPEAT_CAP = 3           # identical non-write call N times -> loop
