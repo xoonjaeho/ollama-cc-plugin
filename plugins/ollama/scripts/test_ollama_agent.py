@@ -864,6 +864,24 @@ class AsClaudeWorktreeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(repo, "committed.txt")))  # real tree untouched
         self.assertTrue(self._no_extra_worktree(repo))                          # worktree removed
 
+    def test_as_claude_permission_mode_replaces_the_bypass_flag(self):
+        # A non-bypass mode must reach claude as --permission-mode <mode> and must NOT keep
+        # --dangerously-skip-permissions alongside it -- otherwise "auto" silently still runs
+        # with every action pre-approved.
+        seen = {}
+
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            seen["argv"] = argv
+            return {"is_error": False, "session_id": None, "result": "done", "permission_denials": 3}
+
+        oa._launch_claude = fake_launch
+        r = oa.run_as_claude_in_worktree(_init_repo(), self._task_file(), permission_mode="auto")
+        self.assertEqual(seen["argv"][6:10], ["-p", "--permission-mode", "auto", "--output-format"])
+        self.assertNotIn("--dangerously-skip-permissions", seen["argv"])
+        # The denial count must survive into the report: under a non-bypass mode it is the only
+        # signal separating "the mode blocked the work" from "nothing needed changing".
+        self.assertEqual(r["permission_denials"], 3)
+
     def test_launch_error_with_no_edits_offers_no_diff(self):
         # A failed launch that made no edits is flagged is_error with NO diff_file, so the
         # apply gate has nothing to offer -- and an untrusted diff_file key in the launch

@@ -783,14 +783,33 @@ def _launch_claude(argv, cwd, task_file, env, timeout=TIMEOUT_TOTAL):
         sid = data.get("session_id") if isinstance(data, dict) else None
         return {"is_error": True, "session_id": sid, "returncode": rc,
                 "result": "ollama launch failed (exit %s): %s" % (rc, detail)}
+    # Carry the denial COUNT, not the list: under a non-bypass permission mode a headless run
+    # denies tool calls and keeps going, so is_error stays false and an empty diff is otherwise
+    # indistinguishable from "nothing needed changing". Coerced to int here so no untrusted
+    # launch data reaches the report.
+    denials = data.get("permission_denials")
     return {"is_error": bool(data.get("is_error")), "returncode": rc,
-            "result": data.get("result") or "", "session_id": data.get("session_id")}
+            "result": data.get("result") or "", "session_id": data.get("session_id"),
+            "permission_denials": len(denials) if isinstance(denials, list) else 0}
 
 
-def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT_TOTAL):
+PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan")
+
+
+def _permission_flags(mode):
+    # bypassPermissions keeps the legacy flag: claude gates --permission-mode bypassPermissions
+    # behind an availability check that --dangerously-skip-permissions bypasses outright.
+    if mode == "bypassPermissions":
+        return ["--dangerously-skip-permissions"]
+    return ["--permission-mode", mode]
+
+
+def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT_TOTAL,
+                              permission_mode="bypassPermissions"):
     """Launch a full Claude Code session inside an isolated worktree off HEAD, then capture
     its changes as a patch the caller can review and apply. The worktree is ALWAYS removed.
-    The returned report is built here (not from the untrusted launch JSON); a diff is offered
+    The returned report is built here (not from the untrusted launch JSON -- only the result
+    text, session id, and denial count are carried over); a diff is offered
     only when git capture actually produced one, independently of the launch's exit status
     (a session that exited nonzero may still have made edits worth reviewing)."""
     repo = os.path.realpath(repo)
@@ -818,8 +837,8 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                 f.write("You are working in a temporary git worktree. Do NOT run git commit here. "
                         "Make file edits, then finish; the user will review and apply your changes separately.\n\n")
                 f.write(original_task)
-            argv = ["ollama", "launch", "claude", "--model", model or DEFAULT_MODEL, "--",
-                    "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+            argv = (["ollama", "launch", "claude", "--model", model or DEFAULT_MODEL, "--", "-p"]
+                    + _permission_flags(permission_mode) + ["--output-format", "json"])
             env = dict(os.environ)
             env["OLLAMA_AS_CLAUDE_ACTIVE"] = "1"
             launch = _launch_claude(argv, wt, wrapped_task, env, timeout=timeout_total)
@@ -830,6 +849,7 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                 pass
         report["result"] = launch.get("result", "")
         report["session_id"] = launch.get("session_id")
+        report["permission_denials"] = launch.get("permission_denials", 0)
         if launch.get("is_error"):
             report["is_error"] = True
             report["stop_reason"] = "launch_error"
@@ -902,6 +922,8 @@ def main(argv=None):
     p.add_argument("--model", default=None)
     p.add_argument("--as-claude", action="store_true",
                    help="as-claude mode: launch a real Claude session in a worktree (no gate token)")
+    p.add_argument("--permission-mode", default="bypassPermissions", choices=PERMISSION_MODES,
+                   help="permission mode of the launched Claude session (--as-claude only)")
     p.add_argument("--think", action="store_true")
     p.add_argument("--allow-shell", action="store_true",
                    help="DANGER: give the agent a run_shell tool -- full RCE, not contained by the worktree")
@@ -917,6 +939,8 @@ def main(argv=None):
             p.error("--as-claude requires --task-file")
     elif not args.repo and not args.root:
         p.error("one of --repo or --root is required")
+    if args.permission_mode != "bypassPermissions" and not args.as_claude:
+        p.error("--permission-mode is only used with --as-claude")
     if args.gate_token is not None:   # the single-use rescue token is only meaningful for a plain --repo run
         if args.as_claude:
             p.error("--gate-token is not used with --as-claude")
@@ -943,7 +967,8 @@ def main(argv=None):
               max_iters=args.max_iters, timeout_total=args.timeout)
     if args.as_claude:
         report = run_as_claude_in_worktree(args.repo, args.task_file, model=args.model,
-                                           timeout_total=args.timeout)
+                                           timeout_total=args.timeout,
+                                           permission_mode=args.permission_mode)
     elif args.repo:
         # the write-capable agent is fail-closed behind the launch gate's token
         if not _consume_gate_token(args.gate_token):
