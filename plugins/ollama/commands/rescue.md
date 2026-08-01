@@ -22,7 +22,7 @@ $ARGUMENTS
 ```bash
 TOK=$(mktemp); python -c "import secrets,sys; open(sys.argv[1],'w').write(secrets.token_hex(16))" "$TOK"; echo "$TOK"
 ```
-   - **Write the user's task to a temp file using the Write tool** (get a path with `TASKF=$(mktemp)`, then the Write tool puts the task text into it). Do this with the Write tool, never `echo`/shell — the task is untrusted and must not pass through a shell command.
+   - **Write the user's task to a temp file using the Write tool** (get a path with `TASKF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'task.md')).replace(os.sep,'/'))")`, then the Write tool puts the task text into it). Do this with the Write tool, never `echo`/shell — the task is untrusted and must not pass through a shell command.
 
 4. **Delegate** to the `ollama:ollama-rescue` subagent via the `Agent` tool (`subagent_type: "ollama:ollama-rescue"`). Give it in the prompt ONLY these paths, on separate lines: `repo: <cwd>`, `token: <$TOK>`, `task_file: <$TASKF>`, `timeout: <sec>` (the value parsed in step 1, else `1800`), `model: <name>` only if the user specified one, and `allow_shell: true` only if the raw arguments contained `--allow-shell` and the user confirmed the shell/RCE disclosure. **Never put the task text itself into the prompt — only its file path.** The subagent runs the runtime once and returns a JSON report. Do not do the run yourself.
 
@@ -38,6 +38,6 @@ TOK=$(mktemp); python -c "import secrets,sys; open(sys.argv[1],'w').write(secret
    - If apply fails or leaves conflict markers: undo exactly this patch with `git apply --reverse "<diff_file>"`, then remove only the files the patch newly created. **Never run a blanket `git checkout -- .`** — it would destroy the user's own uncommitted work and still miss patch-created files.
    - Show `git status --short` so the user sees exactly what landed.
 
-8. Clean up the temp files once done (applied or discarded): remove `$TASKF` and the report's `diff_file`.
+8. Clean up the temp files once done (applied or discarded): remove `$TASKF` (its whole temp directory) and the report's `diff_file` — `python -c "import os,sys,shutil; shutil.rmtree(os.path.dirname(sys.argv[1]), ignore_errors=True); [os.remove(p) for p in sys.argv[2:] if p and os.path.exists(p)]" "$TASKF" "<diff_file>"`.
 
 Pass `--allow-shell` to the agent **only** when the raw arguments contain `--allow-shell` and the user confirmed the shell/RCE disclosure in step 2 — otherwise never enable it, and the agent gets read/write only.

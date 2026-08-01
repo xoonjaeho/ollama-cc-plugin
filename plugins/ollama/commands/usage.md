@@ -1,7 +1,7 @@
 ---
 description: Show your ollama.com cloud usage (session + weekly %)
 argument-hint: ''
-allowed-tools: Bash(python:*), Bash(py:*), Bash(mktemp:*), Bash(rm:*), Write
+allowed-tools: Bash(python:*), Bash(py:*), Bash(rm:*), Write
 ---
 
 Show ollama cloud usage (session + weekly %). The numbers live only on the cookie-gated ollama.com/settings page, read via a stored session cookie.
@@ -21,10 +21,10 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_usage.py" read --json
 
    **Browser (optional, needs Playwright):** `/ollama:usage-login` opens Chrome, the user logs in once, and it captures the cookie automatically.
 
-   **Manual (no dependency):** ask the user to, in their **logged-in Chrome**, open `https://ollama.com/settings`, press F12 → Network → reload → right-click the `settings` document request → Copy → **Copy as cURL**, and paste it. Write that paste to a temp file with the **Write tool** (`CF=$(mktemp)`), then feed it on stdin:
+   **Manual (no dependency):** ask the user to, in their **logged-in Chrome**, open `https://ollama.com/settings`, press F12 → Network → reload → right-click the `settings` document request → Copy → **Copy as cURL**, and paste it. Write that paste to a temp file with the **Write tool** (`CF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'curl.txt')).replace(os.sep,'/'))")`), then feed it on stdin:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_usage.py" set-cookie < "$CF"
 ```
 
-   Remove `$CF` afterward. The command keeps only the durable session cookie (stored `0600`) and verifies it. **Never print the cookie value back.** The stored session lasts until it expires (weeks) or the user logs out; re-run this step then.
+   Remove the temp directory afterward: `python -c "import os,sys,shutil; shutil.rmtree(os.path.dirname(sys.argv[1]), ignore_errors=True)" "$CF"`. The command keeps only the durable session cookie (stored `0600`) and verifies it. **Never print the cookie value back.** The stored session lasts until it expires (weeks) or the user logs out; re-run this step then.
