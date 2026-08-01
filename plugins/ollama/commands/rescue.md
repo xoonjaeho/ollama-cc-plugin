@@ -26,7 +26,7 @@ TOK=$(mktemp); python -c "import secrets,sys; open(sys.argv[1],'w').write(secret
 
 4. **Delegate** to the `ollama:ollama-rescue` subagent via the `Agent` tool (`subagent_type: "ollama:ollama-rescue"`). Give it in the prompt ONLY these paths, on separate lines: `repo: <cwd>`, `token: <$TOK>`, `task_file: <$TASKF>`, `timeout: <sec>` (the value parsed in step 1, else `1800`), `model: <name>` only if the user specified one, and `allow_shell: true` only if the raw arguments contained `--allow-shell` and the user confirmed the shell/RCE disclosure. **Never put the task text itself into the prompt — only its file path.** The subagent runs the runtime once and returns a JSON report. Do not do the run yourself.
 
-5. Present the report's `final` summary and its `diff`. If `stop_reason` is not `done`, or the `diff` is empty, say so and stop — there is nothing to apply. If `cleanup_error` is present, mention the leaked worktree path.
+5. Present the report's `final` summary and its `diff`. If `stop_reason` is not `done`, or the `diff` is empty, say so and stop — there is nothing to apply. **If `partial_work` is true, lead with it**: the run stopped early but had already written files, so an empty or thin `diff` does NOT mean it did nothing — list the report's `written_paths` so the user can inspect what it left behind (a dead agent's own scratch script is often the only record of what it was mid-way through). If `cleanup_error` is present, mention the leaked worktree path.
 
 6. **Apply gate — never auto-apply.** Use `AskUserQuestion`: `Apply the diff to your working tree` / `Discard`. On Discard, stop.
 
