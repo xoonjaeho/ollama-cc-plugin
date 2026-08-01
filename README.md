@@ -90,6 +90,8 @@ export OLLAMA_CC_MODEL=<a-local-model>     # bash
 - **Continue a session** with `--resume <session-id>` — printed only after a `--no-worktree` / `--resume` run; a worktree run is throwaway and non-resumable, so it prints none. Override the model with `--model <name>`.
 - The `total_cost_usd` the session reports is Claude Code's own placeholder estimate, **not** ollama's billing.
 
+**Design note — the danger is the feature.** An earlier review round proposed hardening this into an isolated, read-only consult. That was rejected: every hardening step (config isolation, permission clamping) deletes the only thing `as-claude` offers over `/ollama:ask` — a *full* Claude Code harness driven by an ollama brain. The choice was made deliberately in favour of the full-harness form, framed honestly as remote code execution, with `/ollama:rescue` as the safe alternative for edits you want gated. The launch consent prompt was likewise removed on purpose; **do not re-add it as a "fix"** — the outer session's own Bash permission is the intended checkpoint, and the diff apply-gate still stands.
+
 ## Model management
 
 `/ollama:list`, `/ollama:ps`, and `/ollama:show` are read-only views of the local daemon. `/ollama:pull` and `/ollama:rm` change state, so they **confirm first**: the command shows what will be downloaded (or the model and disk it frees) and only proceeds after you say yes — the underlying script refuses to mutate without an explicit `--yes`, and `rm` only ever deletes the single model you named. All of these talk only to the local daemon; no extra dependencies.
