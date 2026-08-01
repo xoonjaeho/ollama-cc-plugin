@@ -470,9 +470,15 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                 timeout_total if idle_gap else timeout_total - (time.monotonic() - start),
                 EGRESS_BUDGET - egress_bytes)
             egress_bytes += spent
+        partial_work = (reason != "done" and any(
+            a.get("ok") and a.get("tool") in ("write_file", "run_shell") for a in actions))
+        written_paths = [a["args"]["path"] for a in actions
+                         if a.get("ok") and a.get("tool") == "write_file"
+                         and isinstance(a.get("args"), dict) and "path" in a["args"]]
         return {"stop_reason": reason, "iterations": iters, "final": final,
                 "actions": actions, "egress_bytes": egress_bytes,
-                "tool_calls": tool_calls_total, "model": model}
+                "tool_calls": tool_calls_total, "model": model,
+                "partial_work": partial_work, "written_paths": written_paths}
 
     while True:
         iters += 1
@@ -878,6 +884,16 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
             report["diff_error"] = str(e) or "git capture timed out"
             report.pop("diff_file", None)
         else:
+            # Count real source files in the captured patch; exclude build artifacts only.
+            _pyc_end = re.compile(rb"\.pyc(?:\s|\"|$)")
+            source_files = 0
+            for line in diff_bytes.splitlines():
+                if line.startswith(b"diff --git "):
+                    if (b"/__pycache__/" not in line
+                            and b"/.pytest_cache/" not in line
+                            and not _pyc_end.search(line)):
+                        source_files += 1
+            report["source_files"] = source_files
             if diff_bytes.strip():
                 dpath = None
                 try:
@@ -886,6 +902,8 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                         f.write(diff_bytes)
                     report["diff_file"] = dpath
                     report["has_diff"] = True
+                    if source_files == 0:
+                        report["is_error"] = True
                 except OSError as e:                 # e.g. temp volume full: don't lose the work silently
                     if dpath and os.path.exists(dpath):
                         try:

@@ -183,6 +183,40 @@ class LoopTest(unittest.TestCase):
         r = oa.run_agent("bad tool", self.d, max_iters=10)
         self.assertEqual(r["stop_reason"], "malformed")
 
+    def test_partial_work_true_on_non_done_write(self):
+        oa._post = _SeqPost([
+            _asst(tool_calls=[_call("write_file", {"path": "a.txt", "content": "A"})]),
+            _asst(tool_calls=[_call("write_file", {"path": "b.txt", "content": "B"})]),
+        ])
+        r = oa.run_agent("write", self.d, max_iters=2)
+        self.assertEqual(r["stop_reason"], "max_iters")
+        self.assertTrue(r["partial_work"])
+        self.assertEqual(r["written_paths"], ["a.txt", "b.txt"])
+
+    def test_partial_work_false_on_done_write(self):
+        oa._post = _SeqPost([
+            _asst(tool_calls=[_call("write_file", {"path": "out.txt", "content": "X"})]),
+            _asst(content="done"),
+        ])
+        r = oa.run_agent("write out.txt", self.d)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertFalse(r["partial_work"])
+        self.assertEqual(r["written_paths"], ["out.txt"])
+
+    def test_partial_work_false_on_non_done_read_only(self):
+        for n in ("f1.txt", "f2.txt", "f3.txt"):
+            with open(os.path.join(self.d, n), "w") as f:
+                f.write(n)
+        oa._post = _SeqPost([
+            _asst(tool_calls=[_call("read_file", {"path": "f1.txt"})]),
+            _asst(tool_calls=[_call("read_file", {"path": "f2.txt"})]),
+            _asst(tool_calls=[_call("read_file", {"path": "f3.txt"})]),
+        ])
+        r = oa.run_agent("read files", self.d, max_iters=2)
+        self.assertEqual(r["stop_reason"], "max_iters")
+        self.assertFalse(r["partial_work"])
+        self.assertEqual(r["written_paths"], [])
+
     def test_task_file_delivered_literally_not_via_shell(self):
         # the injection fix: task text comes from --task-file, so shell metachars
         # reach the model as literal task text and never touch a shell.
@@ -911,6 +945,40 @@ class AsClaudeWorktreeTest(unittest.TestCase):
         self.assertTrue(r["has_diff"])
         with open(r["diff_file"], encoding="utf-8") as f:
             self.assertIn("edited.txt", f.read())
+        self.assertTrue(self._no_extra_worktree(repo))
+
+    def test_as_claude_pyc_handler_filename_is_counted(self):
+        repo = _init_repo()
+
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            d = os.path.join(cwd, "src")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "module.pyc_handler.py"), "w", encoding="utf-8") as f:
+                f.write("ok\n")
+            return {"is_error": False, "session_id": None, "result": "done"}
+
+        oa._launch_claude = fake_launch
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertTrue(r["has_diff"])
+        self.assertEqual(r["source_files"], 1)
+        self.assertFalse(r["is_error"])
+        self.assertTrue(self._no_extra_worktree(repo))
+
+    def test_as_claude_only_pycache_patch_is_error(self):
+        repo = _init_repo()
+
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            d = os.path.join(cwd, "__pycache__")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "foo.cpython-311.pyc"), "wb") as f:
+                f.write(b"\x00\x01\x02")
+            return {"is_error": False, "session_id": None, "result": "done"}
+
+        oa._launch_claude = fake_launch
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertTrue(r["has_diff"])
+        self.assertEqual(r["source_files"], 0)
+        self.assertTrue(r["is_error"])
         self.assertTrue(self._no_extra_worktree(repo))
 
     def test_capture_failure_is_fatal_and_worktree_removed(self):
