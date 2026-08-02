@@ -21,7 +21,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_usage.py" read --json
 
    **Browser (optional, needs Playwright):** `/ollama:usage-login` opens Chrome, the user logs in once, and it captures the cookie automatically.
 
-   **Manual (no dependency):** ask the user to, in their **logged-in Chrome**, open `https://ollama.com/settings`, press F12 → Network → reload → right-click the `settings` document request → Copy → **Copy as cURL**, and paste it. Write that paste to a temp file with the **Write tool** (`CF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'curl.txt')).replace(os.sep,'/'))")`), then feed it on stdin:
+   **Manual (no dependency):** ask the user to, in their **logged-in Chrome**, open `https://ollama.com/settings`, press F12 → Network → reload → right-click the `settings` document request → Copy → **Copy as cURL**, and paste it. Write that paste to a temp file with the **Write tool** (`CF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'curl.txt')).replace(os.sep,'/'))")` (use `py -3` if `python` is missing)), then feed it on stdin:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_usage.py" set-cookie < "$CF"
