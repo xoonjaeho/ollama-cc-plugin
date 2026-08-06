@@ -8,6 +8,7 @@ Each test catches a concrete regression:
 - a bound (max_iters / loop-detect / malformed) doesn't trip -> runaway
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,6 +51,13 @@ def _no_orphan(messages):
         else:
             i += 1
     return True
+
+
+def _unnumber(text):
+    """Strip tool_read_file's absolute line-number prefix so a test can assert on the
+    source bytes it renders. Keeps these assertions about auto-advance behaviour rather
+    than about the display format."""
+    return "\n".join(re.sub(r"^\s*\d+: ", "", ln) for ln in text.splitlines())
 
 
 class _SeqPost:
@@ -293,7 +301,7 @@ class LoopTest(unittest.TestCase):
         msgs = seq.payloads[-1]["messages"]
         r2 = [m for m in msgs if m.get("role") == "tool" and m.get("tool_call_id") == "r2"]
         self.assertTrue(r2, "second read produced no tool result")
-        self.assertTrue(r2[-1]["content"].startswith("NEW-"),
+        self.assertTrue(_unnumber(r2[-1]["content"]).startswith("NEW-"),
                         "re-read after write was auto-advanced past the new content: %r"
                         % r2[-1]["content"][:20])
 
@@ -305,7 +313,7 @@ class LoopTest(unittest.TestCase):
         self.assertLessEqual(len(first.encode("utf-8")), oa.READ_CAP + 200)
         rest = oa.tool_read_file(self.d, {"path": "big.txt", "offset": oa.READ_CAP})
         self.assertNotIn("[truncated", rest)
-        self.assertTrue(rest.startswith("A"))
+        self.assertTrue(_unnumber(rest).startswith("A"))
 
     def test_next_read_offset_advances_a_reread(self):
         # re-requesting an already-served range with more file left -> next unread chunk

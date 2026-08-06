@@ -51,6 +51,12 @@ LOOP_REPEAT_CAP = 3           # identical non-write call N times -> loop
 # ponytail: char proxy for the token budget at ~2.75 chars/token, kept under NUM_CTX so the
 # server never front-truncates our pinned system+task (client _truncate_history does it first).
 CTX_CHAR_BUDGET = int(NUM_CTX * 2.75)
+# Diff/staging budgets: prefilter before `git add -Af` so a multi-GB ignored build tree can never
+# reach `git diff`, which has fatally malloc'd ~2.5 GB building the binary diff.
+DIFF_MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB: files above this are almost certainly build artifacts or blobs
+DIFF_MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MiB: keeps the patch reviewable and below git's allocator cliff
+DIFF_MAX_FILES = 2000  # count guardrail: tens of thousands of build artifacts would bloat the index
+TEMP_PATCH_TTL_SECONDS = 3600  # 1 hour: longer than any review/apply window; reclaims crashed-run orphans the same day
 
 
 def _derive_read_cap(char_budget):
@@ -102,6 +108,40 @@ def resolve_in_jail(root_real, path):
 
 
 # ---------------------------------------------------------------- tools
+def _count_newlines_before(path, offset):
+    """Count newline bytes in the source prefix [0, offset) without loading the whole file."""
+    if offset <= 0:
+        return 0
+    count = 0
+    with open(path, "rb") as f:
+        remaining = offset
+        while remaining > 0:
+            chunk = f.read(min(remaining, READ_CAP))
+            if not chunk:
+                break
+            count += chunk.count(b"\n")
+            remaining -= len(chunk)
+    return count
+
+
+def _format_numbered(text, start_line, mark_partial_last):
+    """Return text with compact absolute line-number prefixes."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    if not lines:
+        return text
+    last_line = start_line + len(lines) - 1
+    width = len(str(last_line))
+    out = []
+    for i, line in enumerate(lines, start=start_line):
+        suffix = " [partial]" if (mark_partial_last and i == last_line) else ""
+        out.append("%*d: %s%s" % (width, i, line, suffix))
+    return "\n".join(out)
+
+
 def tool_read_file(root_real, args):
     p = resolve_in_jail(root_real, args.get("path"))
     if not os.path.isfile(p):
@@ -115,7 +155,11 @@ def tool_read_file(root_real, args):
             f.seek(offset)
         raw = f.read(READ_CAP + 1)
     text = raw[:READ_CAP].decode("utf-8", "replace")
-    if len(raw) > READ_CAP:
+    truncated = len(raw) > READ_CAP
+    if text or truncated:
+        start_line = _count_newlines_before(p, offset) + 1
+        text = _format_numbered(text, start_line, truncated)
+    if truncated:
         text += ("\n[truncated at %d bytes; call read_file again with offset=%d for more]"
                  % (READ_CAP, offset + READ_CAP))
     return text
@@ -662,6 +706,70 @@ def _remove_worktree(repo, wt):
     return not os.path.exists(wt)
 
 
+def _stage_limited(wt):
+    """Enumerate what `git add -Af` would stage, drop files that exceed the diff
+    budget, then stage only the survivors. Returns {excluded_files, exclusion_reason}.
+    Prefiltering before staging is what stops a multi-GB ignored build tree from
+    reaching `git diff`, which has fatally malloc'd ~2.5 GB building the binary diff."""
+    try:
+        out = subprocess.run(["git", "-C", wt, "ls-files", "-z", "--modified",
+                              "--deleted", "--others"],
+                             capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise GitError("git ls-files timed out: %s" % e)
+    if out.returncode != 0:
+        raise GitError("git ls-files failed: %s" % out.stderr.decode("utf-8", "replace").strip())
+    candidates = []
+    for raw in out.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = raw.decode("utf-8", "replace")
+        full = os.path.join(wt, path)
+        try:
+            size = 0 if not os.path.exists(full) else os.path.getsize(full)
+        except OSError:
+            continue
+        candidates.append((path, size))
+    # Prefer smaller files so the cumulative cap keeps the most reviewable work.
+    candidates.sort(key=lambda x: x[1])
+    accepted = []
+    excluded = []
+    total_bytes = 0
+    for path, size in candidates:
+        if size > DIFF_MAX_FILE_BYTES:
+            excluded.append({"path": path, "size": size,
+                             "reason": "file size %d exceeds %d bytes" % (size, DIFF_MAX_FILE_BYTES)})
+            continue
+        if len(accepted) >= DIFF_MAX_FILES or total_bytes + size > DIFF_MAX_TOTAL_BYTES:
+            excluded.append({"path": path, "size": size,
+                             "reason": "would exceed total budget (%d files or %d bytes)" % (DIFF_MAX_FILES, DIFF_MAX_TOTAL_BYTES)})
+            continue
+        accepted.append(path)
+        total_bytes += size
+    if accepted:
+        batch = 100
+        for i in range(0, len(accepted), batch):
+            r = subprocess.run(["git", "-C", wt, "add", "-f", "--"] + accepted[i:i + batch],
+                               capture_output=True, timeout=120)
+            if r.returncode != 0:
+                raise GitError("git add failed: %s" % r.stderr.decode("utf-8", "replace").strip())
+    reason = None
+    if excluded:
+        reason = "%d file(s) excluded by diff budget (per-file > %d bytes, total <= %d bytes / %d files)" % (
+            len(excluded), DIFF_MAX_FILE_BYTES, DIFF_MAX_TOTAL_BYTES, DIFF_MAX_FILES)
+    return {"excluded_files": excluded, "exclusion_reason": reason}
+
+
+def _claim_patch(path):
+    """Write a sibling lease file so a concurrent sweep knows this patch may still be in use.
+    A live caller renews the lease by touching it; a dead caller's lease expires after TTL."""
+    try:
+        with open(path + ".lease", "w", encoding="utf-8") as f:
+            f.write("claimed\n")
+    except OSError:
+        pass
+
+
 def run_agent_in_worktree(task, repo, **kw):
     """Run the agent inside an isolated worktree at the captured base_sha; the
     user's real tree is never touched. Returns the P1 report plus diff/base_sha;
@@ -677,17 +785,17 @@ def run_agent_in_worktree(task, repo, **kw):
         return {"stop_reason": "worktree_error", "error": str(e), "base_sha": state["base_sha"]}
     try:
         report = run_agent(task, wt, **kw)
+        stage_meta = {"excluded_files": [], "exclusion_reason": None}
         try:
-            # -Af: capture ALL agent writes, incl. paths under .gitignore, else the
-            # agent's work silently vanishes from the diff. check=True on both so a
-            # git failure surfaces instead of masquerading as "no changes".
-            _git(wt, "add", "-Af", check=True)
+            # Prefilter before `git add -Af`: a multi-GB ignored build tree must not reach
+            # git's diff allocator. _stage_limited still captures small ignored agent writes.
+            stage_meta = _stage_limited(wt)
             # Capture the diff as raw BYTES via a direct subprocess. _git() decodes with
             # errors="replace", which corrupts a non-UTF-8 file's bytes to U+FFFD so the patch
             # no longer applies. report["diff"] keeps a lossy-decoded copy for display; diff_file
             # holds the byte-exact patch the apply gate uses. --no-textconv keeps the raw diff.
             dr = subprocess.run(["git", "-C", wt, "diff", "--cached", "--binary", "--no-textconv"],
-                                capture_output=True)
+                                capture_output=True, timeout=120)
             if dr.returncode != 0:
                 raise GitError("git diff failed: %s" % dr.stderr.decode("utf-8", "replace").strip())
             diff_bytes = dr.stdout
@@ -700,8 +808,15 @@ def run_agent_in_worktree(task, repo, **kw):
                 with os.fdopen(fd, "wb") as f:
                     f.write(diff_bytes)
                 report["diff_file"] = dpath
-        except GitError as e:
-            report["diff_error"] = str(e)
+                _claim_patch(dpath)
+        except (GitError, subprocess.TimeoutExpired) as e:
+            # Capture failed/hung and the worktree is about to be removed -> the work is gone.
+            # Fail loudly so the caller never reports "no changes"; offer nothing to apply.
+            report["is_error"] = True
+            report["stop_reason"] = "diff_error"
+            report["diff_error"] = str(e) or "git capture timed out"
+            report.pop("diff_file", None)
+        report.update(stage_meta)
     finally:
         removed = _remove_worktree(repo, wt)
     if not removed:
@@ -859,18 +974,11 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
         if launch.get("is_error"):
             report["is_error"] = True
             report["stop_reason"] = "launch_error"
+        stage_meta = {"excluded_files": [], "exclusion_reason": None}
         try:
-            # -Af captures all writes (incl. gitignored). Diff against the captured base_sha,
-            # NOT --cached: the launched session may commit inside the worktree, and a --cached
-            # diff (index vs the new HEAD) would silently lose committed work. Capture as raw
-            # BYTES via a direct subprocess -- _git() decodes utf-8 with errors="replace",
-            # which would corrupt a non-UTF-8 file's bytes so the patch no longer applies.
-            # Both commands run with --no-textconv + a timeout: a hostile session can plant a
-            # hanging/slow clean or diff filter in the worktree, and the worktree must still be
-            # reaped rather than pinned forever.
-            ad = subprocess.run(["git", "-C", wt, "add", "-Af"], capture_output=True, timeout=120)
-            if ad.returncode != 0:
-                raise GitError("git add failed: %s" % ad.stderr.decode("utf-8", "replace").strip())
+            # Prefilter before `git add -Af`: a multi-GB ignored build tree must not reach
+            # git's diff allocator. _stage_limited still captures small ignored agent writes.
+            stage_meta = _stage_limited(wt)
             dr = subprocess.run(["git", "-C", wt, "diff", "--binary", "--no-textconv", state["base_sha"]],
                                 capture_output=True, timeout=120)
             if dr.returncode != 0:
@@ -902,6 +1010,7 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                         f.write(diff_bytes)
                     report["diff_file"] = dpath
                     report["has_diff"] = True
+                    _claim_patch(dpath)
                     if source_files == 0:
                         report["is_error"] = True
                 except OSError as e:                 # e.g. temp volume full: don't lose the work silently
@@ -913,6 +1022,7 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                     report["is_error"] = True
                     report["stop_reason"] = "diff_error"
                     report["diff_error"] = "could not write patch file: %s" % e
+        report.update(stage_meta)
     finally:
         removed = _remove_worktree(repo, wt)
         if not removed:
@@ -920,6 +1030,36 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
     if cleanup_error:
         report["cleanup_error"] = cleanup_error
     return report
+
+
+def _sweep_orphan_patches():
+    """Delete abandoned diff patches from prior runs. A sibling .lease file that is
+    still fresh means the patch is claimed by a live caller and must be left alone.
+    If the caller died, the lease is never renewed and expires after TTL."""
+    tmp = tempfile.gettempdir()
+    ttl = TEMP_PATCH_TTL_SECONDS
+    now = time.time()
+    for name in os.listdir(tmp):
+        if name.endswith(".lease"):
+            continue
+        if not (name.startswith("ollama-diff-") or name.startswith("ollama-as-claude-diff-")):
+            continue
+        path = os.path.join(tmp, name)
+        lease = path + ".lease"
+        try:
+            if not os.path.isfile(path):
+                continue
+            if os.path.exists(lease):
+                if now - os.path.getmtime(lease) < ttl:
+                    continue
+            elif now - os.path.getmtime(path) < ttl:
+                # No lease yet: give a fresh patch a short race window before reclaiming.
+                continue
+            os.remove(path)
+            if os.path.exists(lease):
+                os.remove(lease)
+        except OSError:
+            pass
 
 
 def main(argv=None):
@@ -930,6 +1070,7 @@ def main(argv=None):
                 reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+    _sweep_orphan_patches()
     p = argparse.ArgumentParser(prog="ollama_agent")
     p.add_argument("task", nargs="?", default=None, help="task text (or via stdin)")
     where = p.add_mutually_exclusive_group(required=False)
