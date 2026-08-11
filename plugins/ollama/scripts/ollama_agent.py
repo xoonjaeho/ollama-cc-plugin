@@ -926,7 +926,7 @@ def _permission_flags(mode):
 
 
 def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT_TOTAL,
-                              permission_mode="bypassPermissions"):
+                              permission_mode="bypassPermissions", max_iters=None):
     """Launch a full Claude Code session inside an isolated worktree off HEAD, then capture
     its changes as a patch the caller can review and apply. The worktree is ALWAYS removed.
     The returned report is built here (not from the untrusted launch JSON -- only the result
@@ -959,7 +959,10 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                         "Make file edits, then finish; the user will review and apply your changes separately.\n\n")
                 f.write(original_task)
             argv = (["ollama", "launch", "claude", "--model", model or DEFAULT_MODEL, "--", "-p"]
-                    + _permission_flags(permission_mode) + ["--output-format", "json"])
+                    + _permission_flags(permission_mode)
+                    + ["--output-format", "json", "--disallowed-tools", "Agent", "Task"])
+            if max_iters is not None:
+                argv += ["--max-turns", str(max_iters)]
             env = dict(os.environ)
             env["OLLAMA_AS_CLAUDE_ACTIVE"] = "1"
             launch = _launch_claude(argv, wt, wrapped_task, env, timeout=timeout_total)
@@ -1088,7 +1091,7 @@ def main(argv=None):
                    help="DANGER: give the agent a run_shell tool -- full RCE, not contained by the worktree")
     p.add_argument("--readonly", action="store_true",
                    help="read-only tools only (read_file/list_dir/grep_search); no write_file/run_shell")
-    p.add_argument("--max-iters", type=int, default=MAX_ITERS)
+    p.add_argument("--max-iters", type=int, default=None)
     p.add_argument("--timeout", type=int, default=TIMEOUT_TOTAL)
     args = p.parse_args(argv)
     if args.as_claude:
@@ -1123,11 +1126,13 @@ def main(argv=None):
         return 2
     kw = dict(model=args.model, think=args.think,
               allow_write=not args.readonly, allow_shell=args.allow_shell and not args.readonly,
-              max_iters=args.max_iters, timeout_total=args.timeout)
+              max_iters=(args.max_iters if args.max_iters is not None else MAX_ITERS),
+              timeout_total=args.timeout)
     if args.as_claude:
         report = run_as_claude_in_worktree(args.repo, args.task_file, model=args.model,
                                            timeout_total=args.timeout,
-                                           permission_mode=args.permission_mode)
+                                           permission_mode=args.permission_mode,
+                                           max_iters=args.max_iters)
     elif args.repo:
         # the write-capable agent is fail-closed behind the launch gate's token
         if not _consume_gate_token(args.gate_token):
