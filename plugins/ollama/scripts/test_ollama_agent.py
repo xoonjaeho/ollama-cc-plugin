@@ -818,6 +818,18 @@ class ReadToolsTest(unittest.TestCase):
         out = oa.tool_grep_search(self.d, {"pattern": "TARGET_TOKEN"})
         self.assertIn("code.py:2:", out)
 
+    def test_grep_search_scans_a_single_file_path(self):
+        # `path` is documented as "directory/file"; os.walk() on a file used to yield nothing,
+        # so every pattern came back "(no matches)" regardless of content.
+        with open(os.path.join(self.d, "code.py"), "w") as f:
+            f.write("alpha\nTARGET_TOKEN here\nbeta\nTARGET_TOKEN again\n")
+        with open(os.path.join(self.d, "other.py"), "w") as f:
+            f.write("TARGET_TOKEN elsewhere\n")
+        out = oa.tool_grep_search(self.d, {"pattern": "TARGET_TOKEN", "path": "code.py"})
+        self.assertIn("code.py:2:", out)
+        self.assertIn("code.py:4:", out)
+        self.assertNotIn("other.py", out)   # scoped to the named file, not its directory
+
     def test_grep_search_jailed(self):
         with self.assertRaises(oa.JailError):
             oa.tool_grep_search(self.d, {"pattern": "x", "path": os.path.join("..", "..")})

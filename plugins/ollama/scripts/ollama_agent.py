@@ -211,7 +211,11 @@ def tool_grep_search(root_real, args):
         raise JailError("invalid regex: %s" % e)
     base = resolve_in_jail(root_real, args.get("path") or ".")
     hits, scanned = [], 0
-    for dirpath, dirnames, filenames in os.walk(base):
+    # The schema documents `path` as "directory/file", and os.walk() on a file yields nothing --
+    # which silently returned "(no matches)" for every pattern. Scan the one file instead.
+    walk = ([(os.path.dirname(base), [], [os.path.basename(base)])] if os.path.isfile(base)
+            else os.walk(base))
+    for dirpath, dirnames, filenames in walk:
         dirnames[:] = [d for d in dirnames if d.lower() != ".git"]  # never descend into .git
         for fn in filenames:
             if scanned >= 5000:
