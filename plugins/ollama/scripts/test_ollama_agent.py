@@ -7,6 +7,8 @@ Each test catches a concrete regression:
 - a failed tool_call isn't turned into an error result -> orphaned turn / desync
 - a bound (max_iters / loop-detect / malformed) doesn't trip -> runaway
 """
+import email.message
+import io
 import os
 import re
 import shutil
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 
 import ollama_agent as oa
 import ollama_companion as oc
@@ -837,6 +840,54 @@ class ReadToolsTest(unittest.TestCase):
     def test_readonly_toolset_excludes_write_and_shell(self):
         _, dispatch = oa._toolset(allow_write=False, allow_shell=False)
         self.assertEqual(set(dispatch), {"read_file", "list_dir", "grep_search"})
+
+
+class ApiErrorTest(unittest.TestCase):
+    """A stop reason of bare `api_error:HTTPError` cost a whole investigation: it named the
+    exception class and threw away the status and body, which are what say *why* the server
+    refused. These pin both into the stop reason, bounded."""
+
+    def _http_error(self, code, body):
+        return urllib.error.HTTPError("http://x/api/chat", code, "err", email.message.Message(), io.BytesIO(body))
+
+    def test_json_error_body_reaches_the_stop_reason(self):
+        e = self._http_error(400, b'{"error":"context length exceeded"}')
+        self.assertEqual(oa._api_error(e), "api_error:HTTP 400 context length exceeded")
+
+    def test_empty_body_still_carries_the_status(self):
+        self.assertEqual(oa._api_error(self._http_error(502, b"")), "api_error:HTTP 502")
+
+    def test_unreadable_body_does_not_mask_the_status(self):
+        e = urllib.error.HTTPError("http://x/api/chat", 503, "err", email.message.Message(), None)
+        self.assertEqual(oa._api_error(e), "api_error:HTTP 503")
+
+    def test_non_utf8_body_is_replaced_not_raised(self):
+        out = oa._api_error(self._http_error(500, b"\xff\xfe binary junk"))
+        self.assertTrue(out.startswith("api_error:HTTP 500 "))
+        self.assertIn("binary junk", out)
+
+    def test_oversized_body_is_capped(self):
+        out = oa._api_error(self._http_error(413, b'{"error":"' + b"x" * 100000 + b'"}'))
+        self.assertLess(len(out), 350)          # bounded, never the whole upstream page
+        self.assertIn('{"error":"xxx', out)     # read cap cuts the JSON, so the raw prefix is kept
+
+    def test_non_http_failure_keeps_the_exception_name(self):
+        self.assertEqual(oa._api_error(TimeoutError()), "api_error:TimeoutError")
+
+    def test_run_agent_surfaces_the_status_when_chat_rejects(self):
+        d = tempfile.mkdtemp()
+        orig = oa._post
+
+        def reject(path, payload, timeout=None):
+            raise self._http_error(400, b'{"error":"model requires more system memory"}')
+
+        oa._post = reject
+        try:
+            r = oa.run_agent("task", d, max_iters=2)
+        finally:
+            oa._post = orig
+        self.assertEqual(r["stop_reason"],
+                         "api_error:HTTP 400 model requires more system memory")
 
 
 class GateTokenTest(unittest.TestCase):

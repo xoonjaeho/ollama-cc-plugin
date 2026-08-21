@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
 from ollama_companion import (  # noqa: E402
@@ -472,6 +473,27 @@ def _system_prompt(root, allow_write=True):
         "Working root: %s" % root)
 
 
+def _api_error(e):
+    """Stop-reason text for a failed `/api/chat` call.
+
+    `type(e).__name__` alone renders every rejection as a bare `HTTPError`, which says nothing
+    about what the server refused -- context length, auth, a bad payload field all read alike.
+    The status and the body are what make the next occurrence self-diagnosing, so keep both,
+    bounded. A body that cannot be read must never mask the status.
+    """
+    if not isinstance(e, urllib.error.HTTPError):
+        return "api_error:%s" % type(e).__name__
+    try:
+        raw = e.read(4096).decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 - consumed, closed, or absent body
+        raw = ""
+    try:
+        detail = str(json.loads(raw).get("error", "")) or raw
+    except Exception:  # noqa: BLE001 - HTML error pages and truncated JSON are still informative
+        detail = raw
+    return "api_error:HTTP %s%s" % (e.code, (" %s" % detail[:300]) if detail else "")
+
+
 def _append_tool(messages, tool_call_id, name, content):
     m = {"role": "tool", "tool_name": name, "content": content}
     if tool_call_id:
@@ -544,7 +566,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
         try:
             data = _post("/api/chat", payload, timeout=_req_timeout())
         except Exception as e:  # noqa: BLE001 - surface any transport/parse failure as a stop
-            return stop("api_error:%s" % type(e).__name__)
+            return stop(_api_error(e))
         if not isinstance(data, dict):
             return stop("api_error:non-dict-response")
         if data.get("error"):   # ollama can answer 200 with an {"error": ...} body
@@ -567,7 +589,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             try:
                 data = _post("/api/chat", payload2, timeout=_req_timeout())
             except Exception as e:  # noqa: BLE001
-                return stop("api_error:%s" % type(e).__name__)
+                return stop(_api_error(e))
             if not isinstance(data, dict):
                 return stop("api_error:non-dict-response")
             if data.get("error"):
