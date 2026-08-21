@@ -17,12 +17,12 @@ $ARGUMENTS
    - **If (and only if) the raw arguments contain `--allow-shell`**, add a second, stronger line: the agent will also get a `run_shell` tool = **arbitrary code execution that is NOT contained by the worktree** — it can read, modify, delete, or exfiltrate any file on this host (including secrets/keys) and reach the network. With a cloud model this is a third party running code on your machine. Only proceed if you truly intend that.
    Options: `Proceed — isolated worktree, review diff before apply (Recommended)` / `Cancel`. On Cancel, stop. (When `--allow-shell` is set, make the proceed option name it, e.g. `Proceed WITH shell/RCE`.)
 
-3. On proceed:
-   - **Mint a fresh single-use launch token** (a short-lived nonce the runtime consumes; it fails closed without it):
+3. On proceed, **in this order** — the task file first, the token last:
+   - **Write the user's task to a temp file using the Write tool** (get a path with `TASKF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'task.md')).replace(os.sep,'/'))")` (use `py -3` if `python` is missing), then the Write tool puts the task text into it). Do this with the Write tool, never `echo`/shell — the task is untrusted and must not pass through a shell command.
+   - **Mint a fresh single-use launch token — LAST, immediately before step 4** (a short-lived nonce the runtime consumes; it fails closed without it). ⚠ The token is valid for **120 seconds from its mtime** and is consumed even by a failed check, so anything slow — authoring the task file, the gate in step 2, an extra question — must already be done. Dispatch in the very next message. On expiry the token file is gone: re-mint, never reuse the path's old contents.
 ```bash
 TOK=$(mktemp); python -c "import secrets,sys; open(sys.argv[1],'w').write(secrets.token_hex(16))" "$TOK"; echo "$TOK"
 ```
-   - **Write the user's task to a temp file using the Write tool** (get a path with `TASKF=$(python -c "import tempfile,os; print((os.path.join(tempfile.mkdtemp(),'task.md')).replace(os.sep,'/'))")` (use `py -3` if `python` is missing), then the Write tool puts the task text into it). Do this with the Write tool, never `echo`/shell — the task is untrusted and must not pass through a shell command.
 
 4. **Delegate** to the `ollama:ollama-rescue` subagent via the `Agent` tool (`subagent_type: "ollama:ollama-rescue"`). Give it in the prompt ONLY these paths, on separate lines: `repo: <cwd>`, `token: <$TOK>`, `task_file: <$TASKF>`, `timeout: <sec>` (the value parsed in step 1, else `1800`), `model: <name>` only if the user specified one, `max_iters: <N>` only if the user specified `--max-iters <N>`, and `allow_shell: true` only if the raw arguments contained `--allow-shell` and the user confirmed the shell/RCE disclosure. **Never put the task text itself into the prompt — only its file path.** The subagent runs the runtime once and returns a JSON report. Do not do the run yourself.
 
