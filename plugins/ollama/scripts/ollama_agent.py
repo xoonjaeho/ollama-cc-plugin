@@ -79,6 +79,22 @@ class GitError(Exception):
 
 
 # ---------------------------------------------------------------- path jail
+def _suggest_relative(root_real, path):
+    """What the caller should have typed instead of an absolute path."""
+    try:
+        # realpath BOTH sides, exactly as resolve_in_jail does: an 8.3 short root
+        # (`C:\Users\ADMINI~1\...`, which is what tempfile hands out here) compared
+        # against a long-form path yields `..` and a suggestion that is plain wrong.
+        rel = os.path.relpath(os.path.realpath(str(path)), os.path.realpath(str(root_real)))
+    except ValueError:  # a different drive -- relpath refuses outright
+        return "a path relative to the root (this one is on another drive)"
+    # `startswith(os.pardir)` alone also matches a real in-root file named `..foo`,
+    # which would be reported as outside the root. Only a `..` component escapes.
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return "a path relative to the root (this one is outside it and unreachable)"
+    return "'%s'" % rel.replace(os.sep, "/")
+
+
 def resolve_in_jail(root_real, path):
     """Absolute real path if `path` resolves strictly inside root_real, else
     JailError. See module docstring for the containment boundary."""
@@ -86,9 +102,16 @@ def resolve_in_jail(root_real, path):
         raise JailError("empty path")
     path = str(path)
     # No legit in-jail relative path contains ':' -- bans NTFS alternate data
-    # streams (a.txt:stream, .git:stream) and drive-relative (C:foo).
+    # streams (a.txt:stream, .git:stream) and drive-relative (C:foo). On Windows
+    # that also rejects every absolute path, INCLUDING one inside the root, so the
+    # message has to name the root-relative form or the caller retypes the same
+    # path with a different drive letter.
     if ":" in path:
-        raise JailError("':' not allowed in path: %s" % path)
+        raise JailError(
+            "':' not allowed in path: %s -- tool paths are relative to the "
+            "working root (%s), so absolute paths are rejected even when they "
+            "point inside it. Retry with %s"
+            % (path, root_real, _suggest_relative(root_real, path)))
     # realpath the root too: normalizes 8.3 short names, symlinks, and case so the
     # root prefix actually matches the candidate's resolved prefix.
     root_real = os.path.realpath(root_real)
@@ -693,6 +716,19 @@ def _git(repo, *args, check=False):
     return r
 
 
+def _porcelain_name(line):
+    """The path out of one `git status --porcelain` line.
+
+    Two shapes defeat a plain `line[3:]`: a rename/copy reads `R  old -> new`, where
+    only the new path is what the agent would miss, and `core.quotepath` wraps a path
+    containing spaces or non-ASCII in double quotes.
+    """
+    name = line[3:]
+    if " -> " in name:
+        name = name.split(" -> ", 1)[1]
+    return name.strip('"')
+
+
 def _git_state(repo):
     """Preconditions for a rescue run; raises GitError to refuse."""
     if _git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
@@ -708,8 +744,20 @@ def _git_state(repo):
                    "REVERT_HEAD", "sequencer"):
         if os.path.exists(os.path.join(gd, marker)):
             raise GitError("a %s is in progress; finish or abort it first" % marker)
+    porcelain = _git(repo, "status", "--porcelain").stdout.strip()
+    if porcelain:
+        # Both callers of this function go on to check out a worktree at the captured
+        # HEAD, so uncommitted work is invisible to the agent by construction. The
+        # `dirty_base` flag in the final report says the same thing -- but only after
+        # the run has been paid for. Warn, never refuse: HEAD may be exactly what the
+        # caller meant. One guard here covers both entry points.
+        names = [_porcelain_name(line) for line in porcelain.splitlines()]
+        shown = ", ".join(names[:10]) + (" ..." if len(names) > 10 else "")
+        print("warning: %d uncommitted change(s) in %s will NOT be visible to the agent "
+              "-- the worktree is checked out at HEAD. Commit them first if the agent "
+              "needs them: %s" % (len(names), repo, shown), file=sys.stderr)
     return {"base_sha": head.stdout.strip(),
-            "dirty": bool(_git(repo, "status", "--porcelain").stdout.strip()),
+            "dirty": bool(porcelain),
             "detached": _git(repo, "symbolic-ref", "-q", "HEAD").returncode != 0}
 
 

@@ -7,6 +7,7 @@ Each test catches a concrete regression:
 - a failed tool_call isn't turned into an error result -> orphaned turn / desync
 - a bound (max_iters / loop-detect / malformed) doesn't trip -> runaway
 """
+import contextlib
 import email.message
 import io
 import os
@@ -123,6 +124,26 @@ class JailTest(unittest.TestCase):
     def test_rejects_colon_ads(self):
         with self.assertRaises(oa.JailError):
             oa.resolve_in_jail(self.d, "a.txt:stream")
+
+    def test_in_root_absolute_path_is_rejected_but_names_the_relative_form(self):
+        # The ':' ban rejects an absolute path that points INSIDE the root too, so
+        # the message must hand back the relative form -- otherwise the caller just
+        # retypes the same absolute path. Regression: reverting to the bare
+        # "':' not allowed in path" string drops the suggestion and fails here.
+        if sys.platform != "win32":
+            self.skipTest("drive-letter absolute paths are a windows shape")
+        inside = os.path.join(self.d, "a.txt")
+        with self.assertRaises(oa.JailError) as cm:
+            oa.resolve_in_jail(self.d, inside)
+        self.assertIn("'a.txt'", str(cm.exception))
+
+    def test_suggestion_does_not_call_a_dotdot_prefixed_file_outside_the_root(self):
+        # `rel.startswith("..")` also matches a real in-root file named `..hidden`,
+        # which would be reported as unreachable. Only a `..` COMPONENT escapes.
+        self.assertEqual(oa._suggest_relative(self.d, os.path.join(self.d, "..hidden")),
+                         "'..hidden'")
+        self.assertIn("outside it",
+                      oa._suggest_relative(self.d, os.path.join(self.d, "..", "escaped")))
 
     def test_rejects_git_trailing_space(self):
         # NTFS strips trailing space -> ".git " would become a real .git dir
@@ -694,6 +715,39 @@ class WorktreeTest(unittest.TestCase):
     def test_non_git_refused(self):
         r = oa.run_agent_in_worktree("x", tempfile.mkdtemp())
         self.assertEqual(r["stop_reason"], "precondition")
+
+    def test_dirty_base_warns_at_launch_and_names_the_files(self):
+        # `dirty_base` in the final report tells the caller only after the run is paid
+        # for. The warning has to name the files at launch, and must NOT refuse -- HEAD
+        # may be exactly what was meant. Regression: dropping the stderr print, or
+        # printing only a boolean, fails here.
+        repo = _init_repo()
+        with open(os.path.join(repo, "uncommitted.txt"), "w") as f:
+            f.write("not committed\n")
+        oa._post = _SeqPost([_asst(content="done")])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            r = oa.run_agent_in_worktree("noop", repo)
+        self.assertEqual(r["stop_reason"], "done")   # warned, not refused
+        self.assertTrue(r["dirty_base"])
+        self.assertIn("uncommitted.txt", err.getvalue())
+
+    def test_porcelain_name_handles_renames_and_quoted_paths(self):
+        # `line[3:]` alone misnames exactly two shapes, and both were flagged by
+        # review: a rename carries `old -> new`, and core.quotepath wraps a path with
+        # spaces in quotes. Reverting to the plain slice fails both assertions.
+        self.assertEqual(oa._porcelain_name("R  old.py -> new.py"), "new.py")
+        self.assertEqual(oa._porcelain_name('?? "has space.txt"'), "has space.txt")
+        self.assertEqual(oa._porcelain_name(" M src/a.py"), "src/a.py")
+
+    def test_clean_base_does_not_warn(self):
+        repo = _init_repo()
+        oa._post = _SeqPost([_asst(content="done")])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            r = oa.run_agent_in_worktree("noop", repo)
+        self.assertFalse(r["dirty_base"])
+        self.assertNotIn("uncommitted change", err.getvalue())
 
     def test_worktree_isolates_and_captures_diff(self):
         repo = _init_repo()
