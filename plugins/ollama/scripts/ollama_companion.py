@@ -6,7 +6,7 @@ Talks to the local ollama daemon over its REST API (/api/version, /api/tags,
 HTTP call -- no app-server, session, or job control (see the plan for why).
 
 Env overrides:
-  OLLAMA_CC_MODEL  default model for `run` (default: glm-5.2:cloud)
+  OLLAMA_CC_MODEL  default model for `run` (default: glm-5.3:cloud)
   OLLAMA_CC_HOST   base URL of the daemon; falls back to ollama's own
                    OLLAMA_HOST (bare host:port is accepted), then localhost
 """
@@ -18,7 +18,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_MODEL = os.environ.get("OLLAMA_CC_MODEL", "glm-5.2:cloud")
+DEFAULT_MODEL = os.environ.get("OLLAMA_CC_MODEL", "glm-5.3:cloud")
 TIMEOUT = 600  # ponytail: default 600s; --timeout overrides for huge-diff reviews
 PROMPT_WARN_CHARS = 100_000  # ~30k tokens; warn (never block) so an oversized diff can't silently overflow a ~32k-ctx model
 EXIT_CONFIRM = 10  # pull/rm refuse to mutate without --yes; signals "confirm, then re-run with --yes"
@@ -184,7 +184,7 @@ def _emit(obj, as_json):
         for m in obj["models"]:
             print("  - %s%s" % (m["name"], "  [cloud]" if m["cloud"] else ""))
     elif not obj.get("models_error"):
-        print("no models installed. Pull one, e.g. `ollama pull glm-5.2:cloud`.")
+        print("no models installed. Pull one, e.g. `ollama pull glm-5.3:cloud`.")
     if obj.get("note_cloud_auth"):
         print(obj["note_cloud_auth"])
 
@@ -540,7 +540,7 @@ def cmd_list(args):
         print(json.dumps(models, ensure_ascii=False, indent=2))
         return 0
     if not models:
-        print("no models installed. Pull one, e.g. `ollama pull glm-5.2:cloud`.")
+        print("no models installed. Pull one, e.g. `ollama pull glm-5.3:cloud`.")
         return 0
     print("available models:")
     for m in models:

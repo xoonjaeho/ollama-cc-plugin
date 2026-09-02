@@ -15,7 +15,7 @@ MODES:
   so use a scratch/throwaway root.
 - --allow-shell: adds run_shell = uncontained RCE (opt-in; see the plan).
 
-Cloud model default (glm-5.2:cloud); local/cloud is a config knob
+Cloud model default (glm-5.3:cloud); local/cloud is a config knob
 (OLLAMA_CC_MODEL), not a gate.
 
 CONTAINMENT (file tools): no tool path can escape --root. The boundary is realpath

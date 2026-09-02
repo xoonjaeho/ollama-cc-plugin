@@ -24,7 +24,7 @@ Throughout, if `python` is not found, use `py -3` instead — including the gate
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/ollama_companion.py" setup --json
 ```
-   - The model to use is `--model <name>` if the user gave one, else the JSON's `default_model` (this respects `OLLAMA_CC_MODEL`; do not hard-code `glm-5.2:cloud`).
+   - The model to use is `--model <name>` if the user gave one, else the JSON's `default_model` (this respects `OLLAMA_CC_MODEL`; do not hard-code `glm-5.3:cloud`).
    - Determine if it is a cloud model: find that model in the JSON's `models` list and read its `cloud` flag. **Fail closed**: if `daemon` is false, or `models_error` is set, or the model is not in the list, treat it as cloud (and mention why).
 4. **Cloud egress gate** — if the model is cloud, the entire diff will be sent to ollama.com. Use `AskUserQuestion` exactly once to confirm before sending:
    - `Send diff to <model> (cloud) (Recommended)`

@@ -36,7 +36,7 @@ Two tiers:
 - **ollama** running locally (`ollama serve` or the Ollama app). Verify with `ollama --version`.
 - **Python 3.x** on `PATH` (stdlib-only, no packages). On Windows, `py -3` is a fallback if `python` is missing.
 - **git** on `PATH` (the agentic rescue uses `git worktree`).
-- For **cloud models** (any model whose name contains `cloud`, e.g. `glm-5.2:cloud`): sign in once with `ollama signin`. Cloud models can rarely return a truncated reply as a normal completion; if the answer looks cut off, re-run the command.
+- For **cloud models** (any model whose name contains `cloud`, e.g. `glm-5.3:cloud`): sign in once with `ollama signin`. Cloud models can rarely return a truncated reply as a normal completion; if the answer looks cut off, re-run the command.
 - **Optional**, only for `/ollama:usage-login` (browser-based session capture): the `playwright` package (`pip install playwright`) + Google Chrome. The manual `/ollama:usage` setup needs nothing extra.
 
 ## Install
@@ -121,7 +121,7 @@ Sessions don't last forever. When yours ends (logout, or the cookie's own lifeti
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `OLLAMA_CC_MODEL` | `glm-5.2:cloud` | Default model for the commands |
+| `OLLAMA_CC_MODEL` | `glm-5.3:cloud` | Default model for the commands |
 | `OLLAMA_CC_HOST` | `http://127.0.0.1:11434` | ollama daemon base URL. Falls back to ollama's own `OLLAMA_HOST` (bare `host:port` accepted) when unset. |
 | `OLLAMA_CC_NUM_CTX` | `32768` | Context window sent to the agentic rescue (`options.num_ctx`); the client-side char budget is derived from it. Lower it for a small-context local model so the agent's pinned system+task aren't front-truncated. |
 | `OLLAMA_USAGE_DIR` | `~/.ollama-usage` | Where the cloud-usage session cookie and cache are stored. |
