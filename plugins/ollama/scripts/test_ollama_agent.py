@@ -1176,6 +1176,38 @@ class AsClaudeWorktreeTest(unittest.TestCase):
         time.sleep(3.5)   # past the grandchild's 2s delay
         self.assertFalse(os.path.exists(marker), "grandchild survived the process-tree kill")
 
+    def test_launch_nonzero_exit_keeps_report_from_json_stdout(self):
+        # Regression: stdout held a valid report but the process exited 1 with a stderr
+        # banner -- the banner must not REPLACE the real result; it rides as launch_detail.
+        child = ("import sys\n"
+                 "print('{\"result\": \"REAL REPORT\", \"session_id\": \"s1\"}')\n"
+                 "sys.stderr.write('[claude-code:unrecognized_model] banner\\n')\n"
+                 "sys.exit(1)\n")
+        r = oa._launch_claude([sys.executable, "-c", child], tempfile.mkdtemp(),
+                              self._task_file(), dict(os.environ), timeout=10)
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["result"], "REAL REPORT")
+        self.assertTrue(r["launch_detail"].startswith("exit 1:"))
+        self.assertIn("unrecognized_model", r["launch_detail"])
+        self.assertEqual(r["session_id"], "s1")
+
+    def test_launch_nonzero_exit_non_json_keeps_failed_message(self):
+        child = "import sys\nprint('not json')\nsys.exit(1)\n"
+        r = oa._launch_claude([sys.executable, "-c", child], tempfile.mkdtemp(),
+                              self._task_file(), dict(os.environ), timeout=10)
+        self.assertTrue(r["is_error"])
+        self.assertTrue(r["result"].startswith("ollama launch failed (exit 1)"))
+
+    def test_launch_detail_survives_into_worktree_report(self):
+        repo = _init_repo()
+        oa._launch_claude = lambda *a, **k: {
+            "is_error": True, "session_id": "s1", "returncode": 1, "result": "REAL REPORT",
+            "permission_denials": 0, "launch_detail": "exit 1: unrecognized model"}
+        r = oa.run_as_claude_in_worktree(repo, self._task_file())
+        self.assertEqual(r["launch_detail"], "exit 1: unrecognized model")
+        self.assertEqual(r["result"], "REAL REPORT")
+        self.assertTrue(self._no_extra_worktree(repo))
+
 
 if __name__ == "__main__":
     unittest.main()

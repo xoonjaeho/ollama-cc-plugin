@@ -927,9 +927,10 @@ def _launch_claude(argv, cwd, task_file, env, timeout=TIMEOUT_TOTAL):
     """Launch `ollama launch claude` with a task on stdin, in its own process group so the
     WHOLE tree is killed on timeout (a plain subprocess timeout reaps only `ollama`, leaving
     the `claude` RCE descendant running after we give up). Returns an ALLOWLISTED dict
-    {is_error, result, session_id, returncode} -- never the raw launch JSON, so a
-    model-controlled `result` cannot smuggle gate-owned keys (diff_file, base_sha) into the
-    caller's report. Fail-closed: a nonzero exit or unparseable output => is_error."""
+    {is_error, result, session_id, returncode, permission_denials, launch_detail} --
+    never the raw launch JSON, so a model-controlled `result` cannot smuggle
+    gate-owned keys (diff_file, base_sha) into the caller's report. Fail-closed: a
+    nonzero exit or unparseable output => is_error."""
     try:
         fh = open(task_file, "r", encoding="utf-8")
     except OSError as e:
@@ -978,9 +979,19 @@ def _launch_claude(argv, cwd, task_file, env, timeout=TIMEOUT_TOTAL):
                 data = None
     if not isinstance(data, dict) or rc != 0:
         detail = (err or raw or "").strip()[:500] or "no output"
-        sid = data.get("session_id") if isinstance(data, dict) else None
-        return {"is_error": True, "session_id": sid, "returncode": rc,
-                "result": "ollama launch failed (exit %s): %s" % (rc, detail)}
+        if not isinstance(data, dict):
+            return {"is_error": True, "session_id": None, "returncode": rc,
+                    "result": "ollama launch failed (exit %s): %s" % (rc, detail)}
+        # Nonzero exit WITH a parseable report: the run's result text is the payload the
+        # caller needs, so it must not be replaced by the stderr banner. The exit detail
+        # rides along as launch_detail instead.
+        result = data.get("result")
+        denials = data.get("permission_denials")
+        return {"is_error": True, "session_id": data.get("session_id"), "returncode": rc,
+                "result": result if isinstance(result, str) and result.strip()
+                          else "ollama launch failed (exit %s): %s" % (rc, detail),
+                "permission_denials": len(denials) if isinstance(denials, list) else 0,
+                "launch_detail": "exit %s: %s" % (rc, detail)}
     # Carry the denial COUNT, not the list: under a non-bypass permission mode a headless run
     # denies tool calls and keeps going, so is_error stays false and an empty diff is otherwise
     # indistinguishable from "nothing needed changing". Coerced to int here so no untrusted
@@ -1051,6 +1062,8 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
         report["result"] = launch.get("result", "")
         report["session_id"] = launch.get("session_id")
         report["permission_denials"] = launch.get("permission_denials", 0)
+        if launch.get("launch_detail") is not None:
+            report["launch_detail"] = launch["launch_detail"]
         if launch.get("is_error"):
             report["is_error"] = True
             report["stop_reason"] = "launch_error"
