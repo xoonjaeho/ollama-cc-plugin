@@ -66,10 +66,29 @@ class AsClaudePoolIsolationTest(unittest.TestCase):
         text = _read("commands/as-claude.md")
         self.assertRegex(text, r"If `--resume` or `--no-worktree` is present, go to step 6")
         direct = text.split("6. **Direct launch", 1)[1]
-        launch = re.search(r"OLLAMA_AS_CLAUDE_ACTIVE=1.*?\| python -c", direct, re.DOTALL)
+        launch = re.search(r"OLLAMA_AS_CLAUDE_ACTIVE=1.*?\| tee \"\$CAPF\" >/dev/null", direct, re.DOTALL)
         self.assertIsNotNone(launch)
         command = " ".join(launch.group(0).replace("\\", " ").split())
         self.assertIn("--disallowed-tools Agent Task", command)
+
+    def test_direct_launch_streams_to_capture_file_and_falls_back_on_no_result(self):
+        text = _read("commands/as-claude.md")
+        direct = text.split("6. **Direct launch", 1)[1]
+        launch = re.search(r"OLLAMA_AS_CLAUDE_ACTIVE=1.*?\| tee \"\$CAPF\" >/dev/null", direct, re.DOTALL)
+        self.assertIsNotNone(launch)
+        command = " ".join(launch.group(0).replace("\\", " ").split())
+        self.assertIn("--output-format stream-json", command)
+        self.assertIn("--verbose", command)
+        self.assertIn('CAPF="$(dirname "$TASKF")/stream.jsonl"', direct)
+        self.assertIn("LAUNCH_EXIT=${PIPESTATUS[0]}", direct)
+
+        parser = re.search(r"python -c \"import sys,json;.*?\" \"\$CAPF\" \"\$LAUNCH_EXIT\"", direct)
+        self.assertIsNotNone(parser)
+        parser_src = parser.group(0)
+        self.assertIn("get('type')=='result'", parser_src)
+        self.assertIn("sid=next((e.get('session_id') for e in evs if e.get('session_id'))", parser_src)
+        self.assertIn("out['session_id']=sid", parser_src)
+        self.assertIn("no final result: the launch ended before claude emitted one (exit %d)", parser_src)
 
 
 class MaxItersForwardingTest(unittest.TestCase):
