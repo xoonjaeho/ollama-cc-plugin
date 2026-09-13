@@ -175,6 +175,21 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(tool_msgs[0]["tool_call_id"], "c1")
         self.assertIn("hello", tool_msgs[0]["content"])
 
+    def test_final_source_is_content_for_a_content_answer(self):
+        oa._post = _SeqPost([_asst(content="plain answer")])
+        r = oa.run_agent("x", self.d)
+        self.assertEqual(r["final"], "plain answer")
+        self.assertEqual(r["final_source"], "content")
+
+    def test_final_source_is_thinking_when_content_is_empty(self):
+        # A reasoning-only final turn: the thinking fallback fills `final`, and the
+        # report must say the answer came from thinking, not content.
+        oa._post = _SeqPost([{"message": {"role": "assistant", "content": "",
+                                          "thinking": "the reasoning answer"}}])
+        r = oa.run_agent("x", self.d)
+        self.assertEqual(r["final"], "the reasoning answer")
+        self.assertEqual(r["final_source"], "thinking")
+
     def test_write_file_lands_in_root(self):
         seq = _SeqPost([_asst(tool_calls=[_call("write_file", {"path": "out.txt", "content": "X"})]),
                         _asst(content="done")])

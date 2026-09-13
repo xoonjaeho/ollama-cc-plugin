@@ -121,10 +121,33 @@ def is_cloud(name, entry=None):
     return bool(name) and "cloud" in name.lower()
 
 
+_KIMI_SEP = "<|open|>response<|sep|>"
+
+
+def _scrub_kimi_sep(content):
+    """kimi-k3 sometimes leaks a literal `<|open|>response<|sep|>` separator into
+    content, mixing deliberation and answer in one field. Only the text after its
+    LAST occurrence is the real answer; an empty tail means no answer in content."""
+    content = (content or "").strip()
+    if _KIMI_SEP in content:
+        content = content.rsplit(_KIMI_SEP, 1)[1].strip()
+    return content
+
+
 def _final_text(msg):
-    """Whitespace-safe content first, thinking fallback. Shared by companion and agent
-    so all paths agree on what counts as an answer."""
-    return (msg.get("content") or "").strip() or (msg.get("thinking") or "").strip()
+    """Whitespace-safe content first (kimi separator scrubbed), thinking fallback.
+    Shared by companion and agent so all paths agree on what counts as an answer."""
+    return _scrub_kimi_sep(msg.get("content")) or (msg.get("thinking") or "").strip()
+
+
+def _final_source(msg):
+    """Origin of _final_text's answer: "content" (post-scrub), "thinking" fallback,
+    or None when both are empty."""
+    if _scrub_kimi_sep(msg.get("content")):
+        return "content"
+    if (msg.get("thinking") or "").strip():
+        return "thinking"
+    return None
 
 
 def _detect_context_length(model):

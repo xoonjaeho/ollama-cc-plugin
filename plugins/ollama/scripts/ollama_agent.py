@@ -38,7 +38,7 @@ import urllib.error
 
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
 from ollama_companion import (  # noqa: E402
-    _post, DEFAULT_MODEL, is_cloud, _final_text, NUM_CTX, _resolve_num_ctx,
+    _post, DEFAULT_MODEL, is_cloud, _final_text, _final_source, NUM_CTX, _resolve_num_ctx,
 )
 
 
@@ -551,7 +551,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             return max(1, int(timeout_total))   # floor a nonsensical --timeout <=0 like the write branch
         return max(1, int(timeout_total - (time.monotonic() - start)))
 
-    def stop(reason, final=""):
+    def stop(reason, final="", final_source=None):
         nonlocal egress_bytes
         if not final and reason in _SYNTH_STOPS:
             # trim to budget first: max_iters bails before _truncate_history, so the
@@ -563,12 +563,15 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                 timeout_total if idle_gap else timeout_total - (time.monotonic() - start),
                 EGRESS_BUDGET - egress_bytes)
             egress_bytes += spent
+            if final:
+                final_source = "synthesis"
         partial_work = (reason != "done" and any(
             a.get("ok") and a.get("tool") in ("write_file", "run_shell") for a in actions))
         written_paths = [a["args"]["path"] for a in actions
                          if a.get("ok") and a.get("tool") == "write_file"
                          and isinstance(a.get("args"), dict) and "path" in a["args"]]
         return {"stop_reason": reason, "iterations": iters, "final": final,
+                "final_source": final_source,
                 "actions": actions, "egress_bytes": egress_bytes,
                 "tool_calls": tool_calls_total, "model": model,
                 "partial_work": partial_work, "written_paths": written_paths}
@@ -600,7 +603,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
         if not tcs:
             final = _final_text(msg)
             if final or empty_retry_done:
-                return stop("done", final=final)
+                return stop("done", final=final, final_source=_final_source(msg))
             # Empty assistant turn: one same-iteration retry so iters is not incremented
             # and preflight is not re-run. Charge egress independently.
             empty_retry_done = True
@@ -621,7 +624,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
             messages[-1] = msg                  # replace the empty assistant turn
             tcs = msg.get("tool_calls") or []
             if not tcs:
-                return stop("done", final=_final_text(msg))
+                return stop("done", final=_final_text(msg), final_source=_final_source(msg))
             # retry produced tool_calls: fall through to the preflight/dispatch below
         # preflight the whole turn against the cap so we never partially apply it
         if tool_calls_total + len(tcs) > TOOL_CALL_CAP:

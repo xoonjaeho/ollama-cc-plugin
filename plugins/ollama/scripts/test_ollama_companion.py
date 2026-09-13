@@ -304,6 +304,27 @@ class TestFinalText(unittest.TestCase):
     def test_whitespace_content_does_not_mask_thinking(self):
         self.assertEqual(oc._final_text({"content": "   ", "thinking": "y"}), "y")
 
+    def test_kimi_separator_keeps_only_response_tail(self):
+        self.assertEqual(oc._final_text({"content": "a<|open|>response<|sep|>b"}), "b")
+
+    def test_kimi_separator_last_occurrence_wins(self):
+        self.assertEqual(
+            oc._final_text({"content": "a<|open|>response<|sep|>b<|open|>response<|sep|>c"}),
+            "c")
+
+    def test_kimi_separator_empty_tail_falls_back_to_thinking(self):
+        self.assertEqual(oc._final_text({"content": "deliberation<|open|>response<|sep|>",
+                                          "thinking": "t"}), "t")
+
+    def test_final_source_content(self):
+        self.assertEqual(oc._final_source({"content": "c", "thinking": "t"}), "content")
+
+    def test_final_source_thinking(self):
+        self.assertEqual(oc._final_source({"content": "", "thinking": "t"}), "thinking")
+
+    def test_final_source_none_when_both_empty(self):
+        self.assertIsNone(oc._final_source({"content": "  ", "thinking": ""}))
+
 
 class TestMainReconfigure(unittest.TestCase):
     """The cp949 fix lives in main(): deleting the reconfigure loop must fail here."""
