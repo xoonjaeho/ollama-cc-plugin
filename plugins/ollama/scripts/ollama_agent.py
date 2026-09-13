@@ -205,6 +205,22 @@ def tool_write_file(root_real, args):
     content = args.get("content")
     if content is None:
         raise JailError("write_file requires 'content'")
+    # Models reliably drop the final newline, so every touched file diffs with
+    # "\ No newline at end of file". Append one newline only when the content lacks
+    # it AND the target is new or already newline-terminated; a pre-existing file
+    # whose bytes end without a newline keeps the model's content unchanged.
+    if content and not content.endswith("\n"):
+        prev_ends_nl = True
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell():
+                    f.seek(-1, os.SEEK_END)
+                    prev_ends_nl = f.read(1) == b"\n"
+                else:
+                    prev_ends_nl = False
+        if prev_ends_nl:
+            content += "\n"
     nbytes = len(content.encode("utf-8"))
     if nbytes > WRITE_CAP:                    # bound each write so a runaway model can't fill the disk pre-review
         raise JailError("write_file content too large: %d bytes (cap %d)" % (nbytes, WRITE_CAP))

@@ -197,7 +197,33 @@ class LoopTest(unittest.TestCase):
         r = oa.run_agent("write out.txt", self.d)
         self.assertEqual(r["stop_reason"], "done")
         with open(os.path.join(self.d, "out.txt")) as f:
-            self.assertEqual(f.read(), "X")
+            self.assertEqual(f.read(), "X\n")   # new file: guard appends the final newline
+
+    def test_write_file_appends_newline_to_new_file(self):
+        oa.tool_write_file(self.d, {"path": "nl.txt", "content": "X"})
+        with open(os.path.join(self.d, "nl.txt"), "rb") as f:
+            self.assertTrue(f.read().endswith(b"\n"))
+
+    def test_write_file_appends_newline_when_existing_file_ended_with_one(self):
+        p = os.path.join(self.d, "e.txt")
+        with open(p, "wb") as f:
+            f.write(b"old\n")
+        oa.tool_write_file(self.d, {"path": "e.txt", "content": "new"})
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), b"new\n")
+
+    def test_write_file_keeps_content_when_existing_file_lacks_newline(self):
+        p = os.path.join(self.d, "c.txt")
+        with open(p, "wb") as f:
+            f.write(b"old")
+        oa.tool_write_file(self.d, {"path": "c.txt", "content": "new"})
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), b"new")   # no newline added to a no-newline file
+
+    def test_write_file_does_not_double_newline(self):
+        oa.tool_write_file(self.d, {"path": "d.txt", "content": "X\n"})
+        with open(os.path.join(self.d, "d.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"X\n")
 
     def test_write_file_rejects_oversize(self):
         big = "A" * (oa.WRITE_CAP + 1)
