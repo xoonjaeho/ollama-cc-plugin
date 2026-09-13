@@ -495,15 +495,15 @@ def _system_prompt(root, allow_write=True):
     # run has no write tool and a read-only completion is a valid, finished run -- telling it
     # the run FAILED and to call write_file would break every review-only task.
     if allow_write:
-        how = ("Use read_file to inspect and write_file to make changes. You keep the full "
-               "content of every file you have already read -- do NOT read the same file again. "
-               "Once you understand the task, STOP reading and call write_file; a run that only "
-               "reads and never writes has FAILED. ")
+        how = ("Use read_file to inspect and write_file to make changes. Earlier tool results "
+               "may be dropped when the context grows; avoid re-reading a file unless you need "
+               "it again. Once you understand the task, STOP reading and call write_file; a run "
+               "that only reads and never writes has FAILED. ")
     else:
         how = ("Use read_file, list_dir and grep_search to inspect -- this run is READ-ONLY, "
-               "there is no write tool. You keep the full content of every file you have already "
-               "read -- do NOT read the same file again. Once you have enough context, STOP "
-               "reading and give your final answer. ")
+               "there is no write tool. Earlier tool results may be dropped when the context "
+               "grows; avoid re-reading a file unless you need it again. Once you have enough "
+               "context, STOP reading and give your final answer. ")
     return (
         "You are a coding agent working inside a working root you cannot escape: "
         "every path you pass to a tool is relative to that root and is confined to it. " + how +
@@ -541,7 +541,8 @@ def _append_tool(messages, tool_call_id, name, content):
 
 
 def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell=False,
-              max_iters=MAX_ITERS, timeout_total=TIMEOUT_TOTAL, idle_gap=False):
+              max_iters=MAX_ITERS, max_tool_calls=TOOL_CALL_CAP,
+              timeout_total=TIMEOUT_TOTAL, idle_gap=False):
     model = model or DEFAULT_MODEL
     tools, dispatch = _toolset(allow_write=allow_write, allow_shell=allow_shell)
     root_real = os.path.realpath(root)
@@ -643,7 +644,7 @@ def run_agent(task, root, model=None, think=False, allow_write=True, allow_shell
                 return stop("done", final=_final_text(msg), final_source=_final_source(msg))
             # retry produced tool_calls: fall through to the preflight/dispatch below
         # preflight the whole turn against the cap so we never partially apply it
-        if tool_calls_total + len(tcs) > TOOL_CALL_CAP:
+        if tool_calls_total + len(tcs) > max_tool_calls:
             return stop("tool_call_cap")
         for tc in tcs:
             tool_calls_total += 1
@@ -1198,8 +1199,11 @@ def main(argv=None):
     p.add_argument("--readonly", action="store_true",
                    help="read-only tools only (read_file/list_dir/grep_search); no write_file/run_shell")
     p.add_argument("--max-iters", type=int, default=None)
+    p.add_argument("--max-tool-calls", type=int, default=None)
     p.add_argument("--timeout", type=int, default=TIMEOUT_TOTAL)
     args = p.parse_args(argv)
+    if args.max_tool_calls is not None and args.max_tool_calls < 1:
+        p.error("--max-tool-calls must be a positive integer")
     if args.as_claude:
         if not args.repo:
             p.error("--as-claude requires --repo")
@@ -1233,6 +1237,7 @@ def main(argv=None):
     kw = dict(model=args.model, think=args.think,
               allow_write=not args.readonly, allow_shell=args.allow_shell and not args.readonly,
               max_iters=(args.max_iters if args.max_iters is not None else MAX_ITERS),
+              max_tool_calls=(args.max_tool_calls if args.max_tool_calls is not None else TOOL_CALL_CAP),
               timeout_total=args.timeout)
     if args.as_claude:
         report = run_as_claude_in_worktree(args.repo, args.task_file, model=args.model,

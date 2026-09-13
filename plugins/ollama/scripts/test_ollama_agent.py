@@ -306,6 +306,35 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("whoami", seen["task"])
 
+    def test_max_tool_calls_raised_by_flag(self):
+        # 41 single tool calls with max_tool_calls=60: must finish, not trip the default 40.
+        responses = [_asst(tool_calls=[_call("read_file", {"path": "f%d.txt" % n})]) for n in range(41)]
+        responses.append(_asst(content="done after many reads"))
+        oa._post = _SeqPost(responses)
+        r = oa.run_agent("read a lot", self.d, max_iters=60, max_tool_calls=60)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertEqual(r["tool_calls"], 41)
+
+    def test_tool_call_cap_default_stops_at_forty(self):
+        responses = [_asst(tool_calls=[_call("read_file", {"path": "f%d.txt" % n})]) for n in range(45)]
+        responses.append(_asst(content="never"))
+        oa._post = _SeqPost(responses)
+        r = oa.run_agent("read a lot", self.d, max_iters=60)
+        self.assertEqual(r["stop_reason"], "tool_call_cap")
+        self.assertEqual(r["tool_calls"], 40)
+
+    def test_system_prompt_no_false_memory_claim(self):
+        for allow_write in (True, False):
+            prompt = oa._system_prompt(self.d, allow_write=allow_write)
+            self.assertNotIn("You keep the full content", prompt)
+            self.assertIn("Earlier tool results may be dropped", prompt)
+
+    def test_cli_rejects_nonpositive_max_tool_calls(self):
+        with self.assertRaises(SystemExit):
+            oa.main(["--root", self.d, "--task-file", "x", "--max-tool-calls", "0"])
+        with self.assertRaises(SystemExit):
+            oa.main(["--root", self.d, "--task-file", "x", "--max-tool-calls", "-3"])
+
     def test_error_body_is_not_done(self):
         oa._post = _SeqPost([{"message": {}, "error": "model failed to load"}])
         r = oa.run_agent("x", self.d)
@@ -408,7 +437,7 @@ class LoopTest(unittest.TestCase):
         self.assertNotIn("FAILED", ro)
         self.assertNotIn("write_file", ro)
         self.assertIn("write_file", rw)                   # write runs still get the write nudge
-        self.assertIn("do NOT read the same file", ro)    # anti-re-read nudge applies in both modes
+        self.assertIn("avoid re-reading a file", ro)     # anti-re-read nudge applies in both modes
 
     def test_detect_context_length_non_dict_response_is_none(self):
         # a valid but wrong-shaped JSON body must not crash the best-effort probe
@@ -591,18 +620,13 @@ class FallbackTest(unittest.TestCase):
         for n in ("a.txt", "b.txt"):
             with open(os.path.join(self.d, n), "w") as f:
                 f.write(n)
-        old = oa.TOOL_CALL_CAP
-        oa.TOOL_CALL_CAP = 1
-        try:
-            seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "a.txt"}),
-                                               _call("read_file", {"path": "b.txt"})]),
-                            _asst(content="synthesized from context")])
-            oa._post = seq
-            r = oa.run_agent("read both", self.d, max_iters=10)
-            self.assertEqual(r["stop_reason"], "tool_call_cap")
-            self.assertIn("synthesized", r["final"])
-        finally:
-            oa.TOOL_CALL_CAP = old
+        seq = _SeqPost([_asst(tool_calls=[_call("read_file", {"path": "a.txt"}),
+                                           _call("read_file", {"path": "b.txt"})]),
+                        _asst(content="synthesized from context")])
+        oa._post = seq
+        r = oa.run_agent("read both", self.d, max_iters=10, max_tool_calls=1)
+        self.assertEqual(r["stop_reason"], "tool_call_cap")
+        self.assertIn("synthesized", r["final"])
 
     def test_readonly_repeated_read_does_not_hard_abort(self):
         # readonly idempotent reads are exempt from the loop guard, so the run
