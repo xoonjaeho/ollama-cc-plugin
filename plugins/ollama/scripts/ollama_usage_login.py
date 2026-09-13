@@ -12,8 +12,7 @@ Requires the optional `playwright` package + Google Chrome. If either is missing
 prints how to install it (or use the manual path) and exits 9.
 
 The stealth flag --disable-blink-features=AutomationControlled hides
-navigator.webdriver so Google/ollama do not block the human login (pattern proven in
-tbd/ig_browser).
+navigator.webdriver so Google/ollama do not block the human login.
 """
 import argparse
 import glob
