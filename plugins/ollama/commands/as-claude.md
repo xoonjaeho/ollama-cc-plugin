@@ -74,6 +74,7 @@ $ARGUMENTS
      if command -v timeout >/dev/null 2>&1; then WRAP="timeout <sec>"; elif command -v gtimeout >/dev/null 2>&1; then WRAP="gtimeout <sec>"; else WRAP=""; echo "warning: neither timeout nor gtimeout found; running uncapped" >&2; fi
      CAPF="$(dirname "$TASKF")/stream.jsonl"
      OLLAMA_AS_CLAUDE_ACTIVE=1 $WRAP ollama launch claude --model "<validated-model>" -- -p <permission-flags> --output-format stream-json --verbose [--resume "<validated-id>"] [--max-turns <N>] \
+       --append-system-prompt "You are <validated-model>, an ollama model running inside Claude Code. You are not Claude. When asked to self-identify, answer exactly '<validated-model>'." \
        --disallowed-tools Agent Task < "$TASKF" 2>/dev/null \
        | tee "$CAPF" >/dev/null
      LAUNCH_EXIT=${PIPESTATUS[0]}

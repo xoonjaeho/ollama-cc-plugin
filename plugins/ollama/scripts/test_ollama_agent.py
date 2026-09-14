@@ -1102,6 +1102,12 @@ class AsClaudeWorktreeTest(unittest.TestCase):
         r = oa.run_as_claude_in_worktree(_init_repo(), self._task_file(), permission_mode="auto")
         self.assertEqual(seen["argv"][6:10], ["-p", "--permission-mode", "auto", "--output-format"])
         self.assertNotIn("--dangerously-skip-permissions", seen["argv"])
+        # Identity goes through the system prompt, not the task text: a first-line "you are X"
+        # in the user turn loses to the harness's own "You are Claude Code" and is absent on
+        # --resume. It must name the launched model so the self-report can be right.
+        i = seen["argv"].index("--append-system-prompt")
+        self.assertEqual(seen["argv"][i + 1], oa.identity_prompt(oa.DEFAULT_MODEL))
+        self.assertIn(oa.DEFAULT_MODEL, seen["argv"][i + 1])
         # The denial count must survive into the report: under a non-bypass mode it is the only
         # signal separating "the mode blocked the work" from "nothing needed changing".
         self.assertEqual(r["permission_denials"], 3)

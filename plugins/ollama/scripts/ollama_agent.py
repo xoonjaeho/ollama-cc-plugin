@@ -490,6 +490,13 @@ def _force_synthesis(messages, model, think, num_ctx, remaining_timeout, remaini
 
 
 # ---------------------------------------------------------------- the loop
+def identity_prompt(model):
+    """Appended to Claude Code's own system prompt so the launched ollama model does not
+    read the harness's "You are Claude Code / powered by ..." lines as its own identity."""
+    return ("You are %s, an ollama model running inside Claude Code. You are not Claude. "
+            "When asked to self-identify, answer exactly '%s'." % (model, model))
+
+
 def _system_prompt(root, allow_write=True):
     # The "must write, else FAILED" mandate applies ONLY when write_file exists. A --readonly
     # run has no write tool and a read-only completion is a valid, finished run -- telling it
@@ -1063,9 +1070,12 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                 f.write("You are working in a temporary git worktree. Do NOT run git commit here. "
                         "Make file edits, then finish; the user will review and apply your changes separately.\n\n")
                 f.write(original_task)
-            argv = (["ollama", "launch", "claude", "--model", model or DEFAULT_MODEL, "--", "-p"]
+            launched_model = model or DEFAULT_MODEL
+            argv = (["ollama", "launch", "claude", "--model", launched_model, "--", "-p"]
                     + _permission_flags(permission_mode)
-                    + ["--output-format", "json", "--disallowed-tools", "Agent", "Task"])
+                    + ["--output-format", "json",
+                       "--append-system-prompt", identity_prompt(launched_model),
+                       "--disallowed-tools", "Agent", "Task"])  # variadic flag stays last
             if max_iters is not None:
                 argv += ["--max-turns", str(max_iters)]
             env = dict(os.environ)
