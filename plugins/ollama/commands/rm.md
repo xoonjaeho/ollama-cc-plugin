@@ -1,5 +1,5 @@
 ---
-description: Delete an installed ollama model (confirms before deleting)
+description: Deletes an installed model; confirms first.
 argument-hint: '<model>'
 allowed-tools: Bash(python:*), Bash(py:*), AskUserQuestion
 ---

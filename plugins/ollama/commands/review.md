@@ -1,5 +1,5 @@
 ---
-description: Review your git changes with an ollama model (read-only; cloud egress gated)
+description: Read-only ollama review of git changes; egress gated.
 argument-hint: '[--model <name>] [--base <ref>] [--timeout <sec>]'
 disable-model-invocation: true
 allowed-tools: Bash(git:*), Bash(python:*), Bash(py:*), Write, AskUserQuestion

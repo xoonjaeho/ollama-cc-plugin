@@ -1,5 +1,5 @@
 ---
-description: Adversarially review your repo with an ollama model that explores it read-only; optionally steer the focus
+description: Read-only: ollama explores repo, challenges design.
 argument-hint: '[--model <name>] [--base <ref>] [--timeout <sec>] [focus: what to challenge]'
 disable-model-invocation: true
 allowed-tools: Bash(python:*), Bash(py:*), Bash(git:*), Write, AskUserQuestion

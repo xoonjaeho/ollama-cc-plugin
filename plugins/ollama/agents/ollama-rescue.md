@@ -1,6 +1,6 @@
 ---
 name: ollama-rescue
-description: Delegate a bounded coding task to an ollama-model-driven agent that reads and writes files in an isolated git worktree and returns a reviewable diff. Use proactively when the main thread wants to hand a self-contained implementation or diagnosis task to ollama; do not grab tasks the main thread can finish quickly itself.
+description: Ollama coding agent, worktree-isolated, returns a diff to review.
 model: sonnet
 tools: Bash
 ---

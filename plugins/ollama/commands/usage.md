@@ -1,5 +1,5 @@
 ---
-description: Show your ollama.com cloud usage (session + weekly %)
+description: Shows ollama.com usage: session and weekly percent.
 argument-hint: ''
 allowed-tools: Bash(python:*), Bash(py:*), Bash(rm:*), Write
 ---

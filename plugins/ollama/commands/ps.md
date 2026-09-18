@@ -1,5 +1,5 @@
 ---
-description: List ollama models currently loaded in memory (running)
+description: Lists ollama models loaded in memory.
 argument-hint: ''
 allowed-tools: Bash(python:*), Bash(py:*)
 ---

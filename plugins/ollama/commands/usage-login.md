@@ -1,5 +1,5 @@
 ---
-description: Capture your ollama.com session for /ollama:usage via a one-time browser login (optional; needs Playwright)
+description: One-time login for ollama.com session; needs Playwright.
 argument-hint: '[--headless]'
 allowed-tools: Bash(python:*), Bash(py:*)
 ---

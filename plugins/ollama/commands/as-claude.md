@@ -1,5 +1,5 @@
 ---
-description: Delegate a task to a FULL Claude Code session powered by an ollama model. Default runs in an isolated git worktree with diff-review apply-gate; --no-worktree keeps full direct access.
+description: Claude session on ollama; worktree-gated, --no-worktree direct.
 argument-hint: '[--model <name>] [--resume <session-id>] [--no-worktree] [--timeout <sec>] [--max-iters <N>] [--permission-mode <mode>] <task>'
 allowed-tools: Bash(ollama:*), Bash(python:*), Bash(py:*), Bash(git:*), Bash(mktemp:*), Bash(timeout:*), Write, AskUserQuestion
 ---

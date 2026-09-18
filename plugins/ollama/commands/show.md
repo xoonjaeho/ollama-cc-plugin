@@ -1,5 +1,5 @@
 ---
-description: Show details of an ollama model (family, parameters, quantization, size)
+description: Shows model family, params, quantization, size.
 argument-hint: '<model>'
 allowed-tools: Bash(python:*), Bash(py:*)
 ---

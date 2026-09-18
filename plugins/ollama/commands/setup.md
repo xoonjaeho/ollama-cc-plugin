@@ -1,5 +1,5 @@
 ---
-description: Check the ollama daemon, list installed models, and flag cloud sign-in
+description: Checks ollama daemon, lists models, flags sign-in.
 argument-hint: ''
 allowed-tools: Bash(python:*), Bash(py:*), Bash(ollama:*), AskUserQuestion
 ---

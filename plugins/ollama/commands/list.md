@@ -1,5 +1,5 @@
 ---
-description: List installed / available ollama models
+description: Lists installed/available ollama models.
 argument-hint: ''
 allowed-tools: Bash(python:*), Bash(py:*)
 ---

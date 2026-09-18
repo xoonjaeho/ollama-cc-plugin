@@ -1,5 +1,5 @@
 ---
-description: Download/install an ollama model (confirms before the download)
+description: Downloads an ollama model; confirms first.
 argument-hint: '<model>'
 allowed-tools: Bash(python:*), Bash(py:*), AskUserQuestion
 ---

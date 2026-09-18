@@ -1,5 +1,5 @@
 ---
-description: Delegate a coding task to an ollama-model agent that edits files in an isolated worktree; review its diff before it touches your tree
+description: Ollama agent writes to a worktree; review diff first.
 argument-hint: '[--model <name>] [--allow-shell] [--timeout <sec>] [--max-iters <N>] <what the ollama agent should do>'
 allowed-tools: Bash(python:*), Bash(py:*), Bash(git:*), Bash(mktemp:*), Write, AskUserQuestion, Agent
 ---

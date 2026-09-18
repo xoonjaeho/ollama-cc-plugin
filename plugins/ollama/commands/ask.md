@@ -1,5 +1,5 @@
 ---
-description: Ask an ollama model a question and return its answer verbatim (read-only second opinion)
+description: Ask an ollama model; read-only, verbatim answer.
 argument-hint: '[--model <name>] [--timeout <sec>] <your question>'
 allowed-tools: Bash(python:*), Bash(py:*), Write
 ---
