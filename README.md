@@ -126,10 +126,6 @@ Sessions don't last forever. When yours ends (logout, or the cookie's own lifeti
 | `OLLAMA_CC_NUM_CTX` | `32768` | Context window sent to the agentic rescue (`options.num_ctx`); the client-side char budget is derived from it. Lower it for a small-context local model so the agent's pinned system+task aren't front-truncated. |
 | `OLLAMA_USAGE_DIR` | `~/.ollama-usage` | Where the cloud-usage session cookie and cache are stored. |
 
-## Relationship to `/octo:debate`
-
-`/octo:debate` orchestrates **multiple** providers for consensus. This plugin is the opposite niche: one model, low ceremony — a fast single second opinion, or a single delegated agent.
-
 ## Runtime & tests
 
 - `plugins/ollama/scripts/ollama_companion.py` — read-only tier (`setup`, `run`) + model management (`list`, `ps`, `show`, `pull`, `rm`).
