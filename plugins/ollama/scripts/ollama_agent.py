@@ -26,10 +26,12 @@ realpath check and the later open()/makedirs -- assumes no concurrent FS mutatio
 (single-actor LLM model). A shell (--allow-shell) is NOT bounded by this jail.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,6 +60,9 @@ DIFF_MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB: files above this are almost cert
 DIFF_MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MiB: keeps the patch reviewable and below git's allocator cliff
 DIFF_MAX_FILES = 2000  # count guardrail: tens of thousands of build artifacts would bloat the index
 TEMP_PATCH_TTL_SECONDS = 3600  # 1 hour: longer than any review/apply window; reclaims crashed-run orphans the same day
+# .worktreeinclude copies are env/config files; a hit on either cap means a pattern caught a data dump.
+WORKTREEINCLUDE_MAX_FILE_BYTES = 1024 * 1024
+WORKTREEINCLUDE_MAX_TOTAL_BYTES = 20 * 1024 * 1024
 
 
 def _derive_read_cap(char_budget):
@@ -76,6 +81,10 @@ class JailError(Exception):
 
 class GitError(Exception):
     pass
+
+
+class WorktreeIncludeError(Exception):
+    """Copying the .worktreeinclude set into the worktree failed; the agent must not run."""
 
 
 # ---------------------------------------------------------------- path jail
@@ -800,18 +809,267 @@ def _make_worktree(repo, base_sha):
     return wt
 
 
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _copy_unchanged(path, digest):
+    try:
+        return os.path.isfile(path) and _sha256(path) == digest
+    except OSError:  # unreadable now counts as modified: it stays out of the patch either way
+        return False
+
+
+def _is_link(path):
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
+    if isjunction is not None:
+        return isjunction(path)
+    try:  # older Pythons: any reparse point counts as a link
+        return bool(getattr(os.lstat(path), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return False
+
+
+def _link_on_path(root, rel):
+    """True when `rel` or any directory between `root` and it is a symlink or junction."""
+    parts = rel.split("/")
+    return any(_is_link(os.path.join(root, *parts[:i])) for i in range(1, len(parts) + 1))
+
+
+def _has_worktreeinclude(repo):
+    """Whether the repository holding `repo` has a .worktreeinclude, found without running git."""
+    top = repo
+    while not os.path.exists(os.path.join(top, ".git")):
+        parent = os.path.dirname(top)
+        if parent == top:
+            return False
+        top = parent
+    return os.path.isfile(os.path.join(top, ".worktreeinclude"))
+
+
+def _dst_blocked(wt, rel):
+    """True when base_sha already has something at `rel` or on its way: a link, a file where a
+    parent directory belongs, or the file itself."""
+    parts = rel.split("/")
+    for i in range(1, len(parts) + 1):
+        path = os.path.join(wt, *parts[:i])
+        if _is_link(path) or (os.path.lexists(path) and (i == len(parts) or not os.path.isdir(path))):
+            return True
+    return False
+
+
+def _worktreeinclude_set(top):
+    """Untracked paths that .worktreeinclude selects AND the repo's own ignore rules ignore."""
+    include = os.path.join(top, ".worktreeinclude")
+    if not os.path.isfile(include):  # --exclude-from on a missing file is fatal, not empty
+        return []
+    selected = _untracked_ignored(top, "--exclude-from=" + include)
+    if not selected:
+        return []
+    # Intersect two exact listings rather than piping into `check-ignore --stdin`, which reads
+    # pathspecs (`[c]ode.md` globs onto a tracked code.md) and rejects GIT_LITERAL_PATHSPECS.
+    ignored = set(_untracked_ignored(top, "--exclude-standard"))
+    return [path for path in selected if path in ignored]
+
+
+def _untracked_ignored(top, exclude_option):
+    ls = subprocess.run(["git", "-C", top, "ls-files", "-z", "--others", "--ignored", exclude_option],
+                        capture_output=True, timeout=120)
+    if ls.returncode != 0:
+        raise GitError("git ls-files failed: %s" % ls.stderr.decode("utf-8", "replace").strip())
+    return [raw.decode("utf-8") for raw in ls.stdout.split(b"\0") if raw]
+
+
+def _blob_id(object_format, data):
+    return hashlib.new(object_format, b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _write_copy(dst, data):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "xb") as f:  # x: never write through a file that is already there
+        f.write(data)
+
+
+def _copy_worktreeinclude(repo, wt):
+    """Copy the .worktreeinclude set from repo's toplevel into wt at the same relative paths.
+
+    Returns (manifest {relpath: sha256 of the copy}, git blob ids of the copied contents), both
+    empty, without a single git call, when .worktreeinclude is absent. Links, on either side, and
+    paths base_sha already occupies or blocks with a file are skipped. Raises WorktreeIncludeError
+    on any failure, including a byte cap that the bytes actually read exceed.
+    """
+    if not _has_worktreeinclude(repo):
+        return {}, set()
+    try:
+        top = os.path.realpath(_git(repo, "rev-parse", "--show-toplevel", check=True).stdout.rstrip("\r\n"))
+        object_format = _git(wt, "rev-parse", "--show-object-format", check=True).stdout.strip()
+        manifest = {}
+        blob_ids = set()
+        total = 0
+        for rel in _worktreeinclude_set(top):
+            src = os.path.join(top, *rel.split("/"))
+            dst = os.path.join(wt, *rel.split("/"))
+            if _link_on_path(top, rel) or not os.path.isfile(src) or _dst_blocked(wt, rel):
+                continue
+            with open(src, "rb") as f:
+                data = f.read(WORKTREEINCLUDE_MAX_FILE_BYTES + 1)
+            if len(data) > WORKTREEINCLUDE_MAX_FILE_BYTES:
+                raise WorktreeIncludeError(".worktreeinclude file %s is over the %d-byte cap"
+                                           % (rel, WORKTREEINCLUDE_MAX_FILE_BYTES))
+            total += len(data)
+            if total > WORKTREEINCLUDE_MAX_TOTAL_BYTES:
+                raise WorktreeIncludeError(".worktreeinclude set exceeds the %d-byte total cap"
+                                           % WORKTREEINCLUDE_MAX_TOTAL_BYTES)
+            _write_copy(dst, data)
+            manifest[rel] = hashlib.sha256(data).hexdigest()
+            if data:  # an empty copy would match every empty file the agent creates
+                blob_ids.add(_blob_id(object_format, data))
+                # core.autocrlf's clean filter stores CRLF content with LF endings.
+                blob_ids.add(_blob_id(object_format, data.replace(b"\r\n", b"\n")))
+        return manifest, blob_ids
+    except (GitError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise WorktreeIncludeError(".worktreeinclude copy failed: %s" % e) from e
+
+
+_C_ESCAPES = {ord("a"): 7, ord("b"): 8, ord("t"): 9, ord("n"): 10, ord("v"): 11, ord("f"): 12, ord("r"): 13,
+              ord('"'): 34, ord("\\"): 92}
+
+
+def _unquote_git_path(raw):
+    """Undo git's C-style quoting of a patch-header path (core.quotePath quotes non-ASCII bytes)."""
+    if not raw.startswith(b'"'):
+        return raw
+    out = bytearray()
+    i = 1
+    while i < len(raw) - 1:
+        if raw[i] == ord("\\"):
+            if raw[i + 1] in _C_ESCAPES:
+                out.append(_C_ESCAPES[raw[i + 1]])
+                i += 2
+            else:
+                out.append(int(raw[i + 1:i + 4], 8))
+                i += 4
+        else:
+            out.append(raw[i])
+            i += 1
+    return bytes(out)
+
+
+def _patch_entries(wt, diff_bytes):
+    """[(old_path, new_path, new_blob_id or None, is_rename)] per file, read from the patch bytes
+    themselves so the guard checks exactly what is returned."""
+    if not diff_bytes.strip():
+        return []
+    try:
+        r = subprocess.run(["git", "-C", wt, "apply", "--numstat", "-z"], input=diff_bytes,
+                           capture_output=True, timeout=120)
+    except OSError as e:
+        raise GitError("git apply --numstat could not run: %s" % e) from e
+    if r.returncode != 0:
+        raise GitError("git apply --numstat failed: %s" % r.stderr.decode("utf-8", "replace").strip())
+    # numstat names only the post-image path, even for a rename or copy; the header names the source.
+    names = [entry.split(b"\t", 2)[2] for entry in r.stdout.split(b"\0") if entry]
+    sections = re.split(rb"(?m)^(?=diff --git )", diff_bytes)[1:]
+    if len(sections) != len(names):
+        raise GitError("patch has %d file sections but git apply parsed %d" % (len(sections), len(names)))
+    entries = []
+    for new, section in zip(names, sections):
+        m = re.search(rb"(?m)^index [0-9a-f]+\.\.([0-9a-f]+)", section)
+        if m and len(m.group(1)) < 40:  # an abbreviated id could never match a copy's full blob id
+            raise GitError("patch lacks full blob ids; capture it with --full-index")
+        source = re.search(rb"(?m)^(rename|copy) from (.*)$", section)
+        old = _unquote_git_path(source.group(2)) if source else new
+        entries.append((old.decode("utf-8", "replace"), new.decode("utf-8", "replace"),
+                        m.group(1).decode("ascii") if m else None,
+                        source is not None and source.group(1) == b"rename"))
+    return entries
+
+
+def _leaked_paths(entries, copies, copy_blobs):
+    """Patch paths that carry a copy: a copied path itself, or any path whose new content is a copy's.
+    A leaked rename takes its source along, so excluding it never leaves a bare deletion behind."""
+    leaked = set()
+    for old, new, blob, is_rename in entries:
+        hit = {p for p in (old, new) if p in copies}
+        if blob in copy_blobs:
+            hit.add(new)
+        if hit and is_rename:
+            hit.update((old, new))
+        leaked |= hit
+    return leaked
+
+
+def _strip_copies_from_diff(wt, diff_args, diff_bytes, copies, copy_blobs):
+    """Final guard: no .worktreeinclude copy reaches the patch, even one the agent staged, committed,
+    renamed or duplicated under another name.
+
+    Returns (`diff_bytes` re-captured without the leaked paths, the sorted leaked paths). Raises
+    GitError when they cannot be excluded cleanly, so the caller writes no patch.
+    """
+    if not copies:
+        return diff_bytes, []
+    entries = _patch_entries(wt, diff_bytes)
+    leaked = sorted(_leaked_paths(entries, copies, copy_blobs))
+    roots = set(copies) | set(leaked)
+    for path in {p for old, new, _, _ in entries for p in (old, new)}:
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            if "/".join(parts[:i]) in roots:
+                raise GitError("copied path %s is now a directory in the worktree; the files below it "
+                               "would not apply over the real file" % "/".join(parts[:i]))
+    for p in leaked:
+        # A literal pathspec also matches everything below a directory of that name.
+        if os.path.isdir(os.path.join(wt, p)):
+            raise GitError("cannot exclude copied path %s from the diff: it is now a directory and "
+                           "excluding it would also drop the agent's files below it" % p)
+    if not leaked:
+        return diff_bytes, []
+    excludes = [":(exclude,literal)" + p for p in leaked]
+    try:
+        dr = subprocess.run(["git", "-C", wt, "diff", *diff_args, "--", *excludes],
+                            capture_output=True, timeout=120)
+    except OSError as e:  # e.g. the pathspecs overflow the Windows command-line limit
+        raise GitError("could not exclude .worktreeinclude copies from the diff: %s" % e) from e
+    if dr.returncode != 0:
+        raise GitError("could not exclude .worktreeinclude copies from the diff: %s"
+                       % dr.stderr.decode("utf-8", "replace").strip())
+    if _leaked_paths(_patch_entries(wt, dr.stdout), copies, copy_blobs):
+        raise GitError("could not exclude .worktreeinclude copies from the diff: copied content remains")
+    return dr.stdout, leaked
+
+
 def _remove_worktree(repo, wt):
     """Scoped removal (no global prune -> can't touch a concurrent run's worktree).
-    Returns True iff the worktree dir is gone afterwards."""
-    _git(repo, "worktree", "remove", "--force", wt)
-    return not os.path.exists(wt)
+    Returns True iff git exited 0 and both the directory and git's registration of it are gone.
+    Never raises, so a cleanup failure cannot replace the run's own report."""
+    try:
+        wt_key = os.path.normcase(os.path.realpath(wt))
+        r = _git(repo, "worktree", "remove", "--force", wt)
+        listed = _git(repo, "worktree", "list", "--porcelain")
+        registered = listed.returncode != 0 or any(
+            os.path.normcase(os.path.realpath(line[len("worktree "):])) == wt_key
+            for line in listed.stdout.splitlines() if line.startswith("worktree "))
+        return r.returncode == 0 and not registered and not os.path.exists(wt)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
 
 
-def _stage_limited(wt):
+def _stage_limited(wt, copies=None):
     """Enumerate what `git add -Af` would stage, drop files that exceed the diff
-    budget, then stage only the survivors. Returns {excluded_files, exclusion_reason}.
-    Prefiltering before staging is what stops a multi-GB ignored build tree from
-    reaching `git diff`, which has fatally malloc'd ~2.5 GB building the binary diff."""
+    budget, then stage only the survivors. Returns {excluded_files, exclusion_reason,
+    modified_copies}. Prefiltering before staging is what stops a multi-GB ignored build
+    tree from reaching `git diff`, which has fatally malloc'd ~2.5 GB building the binary diff.
+    `copies` is the .worktreeinclude manifest {relpath: sha256}: those paths are never staged,
+    and the ones the agent modified or deleted are listed in modified_copies."""
+    copies = copies or {}
+    modified_copies = sorted(rel for rel, digest in copies.items()
+                             if not _copy_unchanged(os.path.join(wt, rel), digest))
     try:
         out = subprocess.run(["git", "-C", wt, "ls-files", "-z", "--modified",
                               "--deleted", "--others"],
@@ -825,6 +1083,8 @@ def _stage_limited(wt):
         if not raw:
             continue
         path = raw.decode("utf-8", "replace")
+        if path in copies:
+            continue
         full = os.path.join(wt, path)
         try:
             size = 0 if not os.path.exists(full) else os.path.getsize(full)
@@ -858,7 +1118,7 @@ def _stage_limited(wt):
     if excluded:
         reason = "%d file(s) excluded by diff budget (per-file > %d bytes, total <= %d bytes / %d files)" % (
             len(excluded), DIFF_MAX_FILE_BYTES, DIFF_MAX_TOTAL_BYTES, DIFF_MAX_FILES)
-    return {"excluded_files": excluded, "exclusion_reason": reason}
+    return {"excluded_files": excluded, "exclusion_reason": reason, "modified_copies": modified_copies}
 
 
 def _claim_patch(path):
@@ -884,23 +1144,28 @@ def run_agent_in_worktree(task, repo, **kw):
         wt = _make_worktree(repo, state["base_sha"])
     except Exception as e:  # GitError, or OSError from tempfile/rmdir
         return {"stop_reason": "worktree_error", "error": str(e), "base_sha": state["base_sha"]}
+    copies, copy_blobs = {}, set()
     try:
+        copies, copy_blobs = _copy_worktreeinclude(repo, wt)
         report = run_agent(task, wt, **kw)
-        stage_meta = {"excluded_files": [], "exclusion_reason": None}
+        stage_meta = {"excluded_files": [], "exclusion_reason": None, "modified_copies": []}
         try:
             # Prefilter before `git add -Af`: a multi-GB ignored build tree must not reach
             # git's diff allocator. _stage_limited still captures small ignored agent writes.
-            stage_meta = _stage_limited(wt)
+            stage_meta = _stage_limited(wt, copies)
             # Capture the diff as raw BYTES via a direct subprocess. _git() decodes with
             # errors="replace", which corrupts a non-UTF-8 file's bytes to U+FFFD so the patch
             # no longer applies. report["diff"] keeps a lossy-decoded copy for display; diff_file
             # holds the byte-exact patch the apply gate uses. --no-textconv keeps the raw diff.
-            dr = subprocess.run(["git", "-C", wt, "diff", "--cached", "--binary", "--no-textconv"],
-                                capture_output=True, timeout=120)
+            # Explicit prefixes: diff.noprefix or diff.mnemonicPrefix would break `git apply -p1`.
+            diff_args = ("--cached", "--binary", "--full-index", "--no-textconv", "--src-prefix=a/",
+                         "--dst-prefix=b/")
+            dr = subprocess.run(["git", "-C", wt, "diff", *diff_args], capture_output=True, timeout=120)
             if dr.returncode != 0:
                 raise GitError("git diff failed: %s" % dr.stderr.decode("utf-8", "replace").strip())
-            diff_bytes = dr.stdout
+            diff_bytes, blocked = _strip_copies_from_diff(wt, diff_args, dr.stdout, copies, copy_blobs)
             report["diff"] = diff_bytes.decode("utf-8", "replace")
+            report["blocked_copies"] = blocked
             if diff_bytes.strip():
                 # Write the patch to a file OUTSIDE the worktree so the command applies it by
                 # path (`git apply <file>`) and never reconstructs untrusted patch text through
@@ -918,10 +1183,13 @@ def run_agent_in_worktree(task, repo, **kw):
             report["diff_error"] = str(e) or "git capture timed out"
             report.pop("diff_file", None)
         report.update(stage_meta)
+    except WorktreeIncludeError as e:
+        report = {"stop_reason": "worktree_error", "is_error": True, "error": str(e)}
     finally:
         removed = _remove_worktree(repo, wt)
     if not removed:
         report["cleanup_error"] = "worktree not removed (may be locked): %s" % wt
+    report["copied_files"] = {"count": len(copies), "paths": sorted(copies)}
     report.update({"base_sha": state["base_sha"], "dirty_base": state["dirty"],
                    "detached": state["detached"]})
     return report
@@ -1059,7 +1327,9 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
               "has_diff": False, "base_sha": state["base_sha"],
               "dirty_base": state["dirty"], "detached": state["detached"]}
     cleanup_error = None
+    copies, copy_blobs = {}, set()
     try:
+        copies, copy_blobs = _copy_worktreeinclude(repo, wt)
         # Defense in depth: tell the launched session not to commit in the worktree. Even if
         # it does, the base_sha diff below still captures the change.
         with open(task_file, "r", encoding="utf-8") as f:
@@ -1094,16 +1364,20 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
         if launch.get("is_error"):
             report["is_error"] = True
             report["stop_reason"] = "launch_error"
-        stage_meta = {"excluded_files": [], "exclusion_reason": None}
+        stage_meta = {"excluded_files": [], "exclusion_reason": None, "modified_copies": []}
         try:
             # Prefilter before `git add -Af`: a multi-GB ignored build tree must not reach
             # git's diff allocator. _stage_limited still captures small ignored agent writes.
-            stage_meta = _stage_limited(wt)
-            dr = subprocess.run(["git", "-C", wt, "diff", "--binary", "--no-textconv", state["base_sha"]],
-                                capture_output=True, timeout=120)
+            stage_meta = _stage_limited(wt, copies)
+            # Explicit prefixes: diff.noprefix or diff.mnemonicPrefix would break `git apply -p1`.
+            diff_args = ("--binary", "--full-index", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+                         state["base_sha"])
+            dr = subprocess.run(["git", "-C", wt, "diff", *diff_args], capture_output=True, timeout=120)
             if dr.returncode != 0:
                 raise GitError("git diff failed: %s" % dr.stderr.decode("utf-8", "replace").strip())
-            diff_bytes = dr.stdout
+            # Also strips a copy the session committed: the base_sha diff would otherwise carry it.
+            diff_bytes, blocked = _strip_copies_from_diff(wt, diff_args, dr.stdout, copies, copy_blobs)
+            report["blocked_copies"] = blocked
         except (GitError, subprocess.TimeoutExpired) as e:
             # Capture failed/hung and the worktree is about to be removed -> the work is gone.
             # Fail loudly so the caller never reports "no changes"; offer nothing to apply.
@@ -1143,12 +1417,15 @@ def run_as_claude_in_worktree(repo, task_file, model=None, timeout_total=TIMEOUT
                     report["stop_reason"] = "diff_error"
                     report["diff_error"] = "could not write patch file: %s" % e
         report.update(stage_meta)
+    except WorktreeIncludeError as e:
+        report.update({"is_error": True, "stop_reason": "worktree_error", "error": str(e)})
     finally:
         removed = _remove_worktree(repo, wt)
         if not removed:
             cleanup_error = "worktree not removed (may be locked): %s" % wt
     if cleanup_error:
         report["cleanup_error"] = cleanup_error
+    report["copied_files"] = {"count": len(copies), "paths": sorted(copies)}
     return report
 
 

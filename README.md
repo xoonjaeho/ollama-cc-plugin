@@ -68,6 +68,7 @@ Local marketplaces take a **relative** path (`./…`), not an absolute one:
 
 - **Isolation.** The agent works in a throwaway `git worktree` off HEAD. Your real working tree is never touched by the agent; you get a diff and apply it yourself (via `git apply --3way`) only after reviewing it. Nothing is auto-applied.
 - **Cloud egress.** With a cloud model, every file the agent reads is sent to `ollama.com`. `/ollama:rescue` discloses this and asks for consent before delegating.
+- **`.worktreeinclude`.** Untracked, gitignored files it lists (e.g. `.env`) are copied into the worktree of `/ollama:rescue` and `/ollama:as-claude`, so the agent can read them and, with a cloud model, they egress like any other file. Only exact copies, at the same path or as the same bytes under another name, are kept out of the diff; a copy's content pasted into a larger file is not detected.
 - **`--allow-shell` is opt-in and is full RCE.** It gives the agent a `run_shell` tool. A shell is **not** contained by the worktree — it can read, modify, delete, or exfiltrate any file on the host (including secrets) and reach the network. With a cloud model that is a third party running code on your machine. The command shows a second, stronger disclosure and only enables it when you pass `--allow-shell` and confirm. Default is read/write only.
 - **Keep it on-machine.** Set `OLLAMA_CC_MODEL` to a local model (see below) so nothing egresses.
 

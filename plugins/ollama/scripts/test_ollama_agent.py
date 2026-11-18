@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from unittest import mock
 
 import ollama_agent as oa
 import ollama_companion as oc
@@ -884,6 +885,475 @@ class WorktreeTest(unittest.TestCase):
             patch = f.read()
         self.assertIn(b"\xe9", patch)                    # raw non-UTF-8 byte preserved
         self.assertNotIn(b"\xef\xbf\xbd", patch)         # NOT the U+FFFD replacement
+
+
+def _write(root, rel, text):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+
+
+def _repo_with_worktreeinclude(include=".env\n/docs/\nnotes.txt\n"):
+    """A repo whose .gitignore ignores .env, docs/ and out/, plus untracked files around them.
+
+    .env and docs/y.md are ignored AND matched by `include`; out/docs/x.md is ignored but not
+    matched by the anchored /docs/; notes.txt is matched but not ignored.
+    """
+    repo = _init_repo()
+    _write(repo, ".gitignore", "docs/\nout/\n.env\n")
+    _write(repo, "sub/keep.txt", "keep\n")
+    if include is not None:
+        _write(repo, ".worktreeinclude", include)
+    subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "ignores"], check=True, capture_output=True)
+    _write(repo, ".env", "SECRET=1\n")
+    _write(repo, "docs/y.md", "local doc\n")
+    _write(repo, "out/docs/x.md", "built\n")
+    _write(repo, "notes.txt", "scratch\n")
+    return repo
+
+
+NEW_AGENT_FILE = "docs/new-agent-file.md"
+
+
+class WorktreeIncludeTest(unittest.TestCase):
+    """Both worktree entry points; run_agent / _launch_claude stand in for the model-driven agent."""
+
+    ENTRIES = ("_run", "_run_as_claude")
+
+    def setUp(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+
+    def _run(self, repo, agent):
+        def fake_run_agent(task, wt, **kw):
+            agent(wt)
+            return {"stop_reason": "done"}
+
+        with mock.patch.object(oa, "run_agent", fake_run_agent), \
+                contextlib.redirect_stderr(io.StringIO()):  # untracked notes.txt -> dirty-base warning
+            return oa.run_agent_in_worktree("task", repo)
+
+    def _run_as_claude(self, repo, agent):
+        def fake_launch(argv, cwd, task_file, env, timeout=None):
+            agent(cwd)
+            return {"is_error": False, "session_id": None, "result": "done"}
+
+        task_file = os.path.join(tempfile.mkdtemp(), "task.txt")
+        _write(os.path.dirname(task_file), "task.txt", "task")
+        with mock.patch.object(oa, "_launch_claude", fake_launch), contextlib.redirect_stderr(io.StringIO()):
+            return oa.run_as_claude_in_worktree(repo, task_file)
+
+    def _patch(self, report):
+        with open(report["diff_file"], "rb") as f:
+            return f.read()
+
+    def _writing(self, extra=None):
+        # The agent's own new file lands in docs/, the ignored directory that also holds a copy.
+        def agent(wt):
+            _write(wt, NEW_AGENT_FILE, "AGENT\n")
+            if extra:
+                extra(wt)
+        return agent
+
+    def _assert_only_main_worktree(self, repo, wt):
+        listed = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"],
+                                capture_output=True, text=True, check=True).stdout
+        entries = [os.path.normcase(os.path.realpath(line[len("worktree "):]))
+                   for line in listed.splitlines() if line.startswith("worktree ")]
+        self.assertEqual(entries, [os.path.normcase(os.path.realpath(repo))])
+        self.assertFalse(os.path.exists(wt))
+
+    def test_copies_only_files_both_included_and_ignored(self):
+        # Regression: dropping the check-ignore filter copies notes.txt; reading .worktreeinclude
+        # from the repo arg (a subdirectory here) instead of the toplevel copies nothing.
+        repo = _repo_with_worktreeinclude()
+        seen = {}
+
+        def agent(wt):
+            for rel in (".env", "docs/y.md", "out/docs/x.md", "notes.txt"):
+                seen[rel] = os.path.isfile(os.path.join(wt, rel))
+            with open(os.path.join(wt, ".env")) as f:
+                seen[".env content"] = f.read()
+
+        r = self._run(os.path.join(repo, "sub"), agent)
+        self.assertEqual(seen, {".env": True, "docs/y.md": True, "out/docs/x.md": False, "notes.txt": False,
+                                ".env content": "SECRET=1\n"})
+        self.assertEqual(r["copied_files"], {"count": 2, "paths": [".env", "docs/y.md"]})
+
+    def test_no_worktreeinclude_copies_nothing(self):
+        seen = []
+        r = self._run(_repo_with_worktreeinclude(include=None),
+                      lambda wt: seen.append(os.path.exists(os.path.join(wt, ".env"))))
+        self.assertEqual(seen, [False])
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertEqual(r["copied_files"], {"count": 0, "paths": []})
+
+    def test_bracketed_ignored_name_next_to_a_tracked_plain_name_is_copied(self):
+        # check-ignore --stdin reads pathspecs: without literal pathspecs `docs/[c]ode.md` globs onto
+        # the tracked docs/code.md, is reported "not ignored", and silently drops out of the copy set.
+        repo = _repo_with_worktreeinclude()
+        _write(repo, "docs/code.md", "tracked\n")
+        subprocess.run(["git", "-C", repo, "add", "-f", "docs/code.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "code"], check=True, capture_output=True)
+        _write(repo, "docs/[c]ode.md", "bracketed\n")
+        seen = []
+
+        def agent(wt):
+            with open(os.path.join(wt, "docs", "[c]ode.md")) as f:
+                seen.append(f.read())
+
+        r = self._run(repo, agent)
+        self.assertEqual(seen, ["bracketed\n"])
+        self.assertEqual(r["copied_files"]["paths"], [".env", "docs/[c]ode.md", "docs/y.md"])
+
+    def test_path_base_sha_already_has_is_not_overwritten(self):
+        # .env is tracked at HEAD but unstaged in the index, so it is both untracked-and-ignored in the
+        # repo and checked out in the worktree: the copy must not replace the checked-out file.
+        repo = _repo_with_worktreeinclude()
+        _write(repo, ".env", "TRACKED\n")
+        subprocess.run(["git", "-C", repo, "add", "-f", ".env"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "env"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "rm", "-q", "--cached", ".env"], check=True, capture_output=True)
+        _write(repo, ".env", "SECRET=1\n")
+        seen = []
+
+        def agent(wt):
+            with open(os.path.join(wt, ".env")) as f:
+                seen.append(f.read())
+
+        r = self._run(repo, agent)
+        self.assertEqual(seen, ["TRACKED\n"])
+        self.assertEqual(r["copied_files"]["paths"], ["docs/y.md"])
+
+    def test_links_in_the_source_are_not_followed(self):
+        repo = _repo_with_worktreeinclude()
+        outside = tempfile.mkdtemp()
+        _write(outside, "z.md", "outside\n")
+        try:
+            import _winapi
+            _winapi.CreateJunction(os.path.realpath(outside), os.path.join(repo, "docs", "j"))
+            os.symlink(os.path.join(repo, "base.txt"), os.path.join(repo, "docs", "s.md"))
+        except (ImportError, OSError) as e:
+            self.skipTest("cannot create a junction and a symlink here: %s" % e)
+        seen = []
+        r = self._run(repo, lambda wt: seen.extend(
+            rel for rel in ("docs/j/z.md", "docs/s.md") if os.path.lexists(os.path.join(wt, rel))))
+        self.assertEqual(seen, [])
+        self.assertEqual(r["copied_files"]["paths"], [".env", "docs/y.md"])
+
+    def test_unchanged_copy_stays_out_of_the_patch(self):
+        r = self._run(_repo_with_worktreeinclude(), self._writing())
+        patch = self._patch(r)
+        self.assertIn(NEW_AGENT_FILE.encode(), patch)
+        self.assertNotIn(b".env", patch)
+        self.assertNotIn(b"docs/y.md", patch)
+        self.assertEqual(r["modified_copies"], [])
+        self.assertEqual(r["blocked_copies"], [])
+
+    def test_guard_makes_no_git_call_when_nothing_was_copied(self):
+        # Without copies the guard has nothing to check; a failing extra git call would cost the patch.
+        with mock.patch.object(oa, "_patch_entries", side_effect=oa.GitError("guard ran without copies")):
+            r = self._run(_repo_with_worktreeinclude(include=None), self._writing())
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertIn(NEW_AGENT_FILE.encode(), self._patch(r))
+
+    def test_modified_or_deleted_copy_is_reported_not_patched(self):
+        def edit(wt):
+            _write(wt, ".env", "SECRET=CHANGED\n")
+            os.remove(os.path.join(wt, "docs", "y.md"))
+
+        r = self._run(_repo_with_worktreeinclude(), self._writing(edit))
+        patch = self._patch(r)
+        self.assertIn(NEW_AGENT_FILE.encode(), patch)
+        self.assertNotIn(b"SECRET", patch)
+        self.assertNotIn(b"docs/y.md", patch)
+        self.assertEqual(r["modified_copies"], [".env", "docs/y.md"])
+
+    def test_copy_the_agent_staged_is_stripped_by_the_final_guard(self):
+        # The agent's own `git add` puts the copy in the index, past _stage_limited's skip;
+        # only the diff-time guard keeps it out of diff_file.
+        def stage(wt):
+            _write(wt, ".env", "SECRET=STAGED\n")
+            subprocess.run(["git", "-C", wt, "add", "-f", ".env"], check=True, capture_output=True)
+
+        r = self._run(_repo_with_worktreeinclude(), self._writing(stage))
+        patch = self._patch(r)
+        self.assertIn(NEW_AGENT_FILE.encode(), patch)
+        self.assertNotIn(b"SECRET", patch)
+        self.assertNotIn("SECRET", r["diff"])
+        self.assertEqual(r["modified_copies"], [".env"])
+        self.assertEqual(r["blocked_copies"], [".env"])
+
+    def test_copy_content_under_a_new_name_is_blocked(self):
+        # The guard matches post-change content and both sides of a rename: a `git mv` of a force-added
+        # copy, byte-for-byte duplicates (one stored through core.autocrlf's CRLF->LF filter), and a
+        # tracked file renamed onto a copy's path, whose source deletion must not survive on its own.
+        repo = _repo_with_worktreeinclude()
+        subprocess.run(["git", "-C", repo, "config", "core.autocrlf", "true"], check=True, capture_output=True)
+        _write(repo, "\ub178\ud2b8.md", "note\n")
+        subprocess.run(["git", "-C", repo, "add", "\ub178\ud2b8.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "note"], check=True, capture_output=True)
+        _write(repo, "docs/crlf.md", "crlf secret\r\n")
+
+        def leak(wt):
+            for src, dst in (("docs/y.md", "leak.txt"), ("docs/crlf.md", "leak-crlf.txt")):
+                with open(os.path.join(wt, src), "rb") as f:
+                    data = f.read()
+                with open(os.path.join(wt, dst), "wb") as f:
+                    f.write(data)
+            moves = (["add", "-f", ".env"], ["mv", ".env", "moved.env"], ["mv", "-f", "\ub178\ud2b8.md", "docs/y.md"])
+            for args in moves:
+                subprocess.run(["git", "-C", wt, *args], check=True, capture_output=True)
+
+        r = self._run(repo, self._writing(leak))
+        patch = self._patch(r)
+        self.assertIn(NEW_AGENT_FILE.encode(), patch)
+        for secret in (b"SECRET", b"local doc", b"crlf secret", b"note", b"rename", b"deleted file"):
+            self.assertNotIn(secret, patch)
+        self.assertEqual(r["blocked_copies"],
+                         ["docs/y.md", "leak-crlf.txt", "leak.txt", "moved.env", "\ub178\ud2b8.md"])
+
+    def test_copy_replaced_by_a_directory_aborts_the_patch(self):
+        # The copy never reaches the index, so only its children are in the patch; they cannot apply
+        # over the user's real file of that name.
+        def replace_with_dir(wt):
+            os.remove(os.path.join(wt, ".env"))
+            _write(wt, ".env/inner.txt", "inner\n")
+
+        r = self._run(_repo_with_worktreeinclude(), self._writing(replace_with_dir))
+        self.assertEqual(r["stop_reason"], "diff_error")
+        self.assertIn("now a directory", r["diff_error"])
+        self.assertNotIn("diff_file", r)
+
+    def test_staged_copy_replaced_by_an_empty_directory_aborts_the_patch(self):
+        # The staged copy is in the patch while its path is a directory in the worktree.
+        def stage_then_replace(wt):
+            _write(wt, ".env", "SECRET=STAGED\n")
+            subprocess.run(["git", "-C", wt, "add", "-f", ".env"], check=True, capture_output=True)
+            os.remove(os.path.join(wt, ".env"))
+            os.makedirs(os.path.join(wt, ".env", "empty"))
+
+        r = self._run(_repo_with_worktreeinclude(), self._writing(stage_then_replace))
+        self.assertEqual(r["stop_reason"], "diff_error")
+        self.assertIn("now a directory", r["diff_error"])
+        self.assertNotIn("diff_file", r)
+
+    def test_exclude_recapture_os_error_ends_in_diff_error(self):
+        # A long exclude list overflows the Windows command line (WinError 206) as an OSError.
+        real_run = subprocess.run
+        worktrees = []
+
+        def run(argv, *args, **kwargs):
+            if any(str(a).startswith(":(exclude,literal)") for a in argv):
+                raise OSError(206, "The filename or extension is too long")
+            return real_run(argv, *args, **kwargs)
+
+        def stage(wt):
+            worktrees.append(wt)
+            subprocess.run(["git", "-C", wt, "add", "-f", ".env"], check=True, capture_output=True)
+
+        repo = _repo_with_worktreeinclude()
+        with mock.patch.object(oa.subprocess, "run", run):
+            r = self._run(repo, self._writing(stage))
+        self.assertEqual(r["stop_reason"], "diff_error")
+        self.assertIn("too long", r["diff_error"])
+        self.assertNotIn("diff_file", r)
+        self._assert_only_main_worktree(repo, worktrees[0])
+
+    def test_copy_under_a_path_base_sha_has_as_a_file_is_skipped(self):
+        # HEAD tracks `docs` as a file; the repo has since replaced it with an ignored docs/ directory.
+        repo = _init_repo()
+        _write(repo, ".gitignore", "docs/\n.env\n")
+        _write(repo, ".worktreeinclude", ".env\n/docs/\n")
+        _write(repo, "docs", "a file at HEAD\n")
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "docs file"], check=True, capture_output=True)
+        os.remove(os.path.join(repo, "docs"))
+        _write(repo, "docs/y.md", "local doc\n")
+        _write(repo, ".env", "SECRET=1\n")
+        seen = []
+        r = self._run(repo, lambda wt: seen.append(os.path.isfile(os.path.join(wt, "docs"))))
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertEqual(seen, [True])
+        self.assertEqual(r["copied_files"]["paths"], [".env"])
+
+    def test_no_worktreeinclude_makes_no_extra_git_calls(self):
+        real_run = subprocess.run
+        calls = []
+
+        def run(argv, *args, **kwargs):
+            calls.append([str(a) for a in argv])
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(oa.subprocess, "run", run):
+            r = self._run(_repo_with_worktreeinclude(include=None), self._writing())
+        self.assertEqual(r["stop_reason"], "done")
+        added = [argv for argv in calls if {"--show-toplevel", "--show-object-format"} & set(argv)
+                 or any(a.startswith("--exclude-") for a in argv)]
+        self.assertEqual(added, [])
+
+    def test_diff_noprefix_config_does_not_hide_a_staged_copy(self):
+        # Under diff.noprefix the patch has no a/ b/ prefixes and `git apply -p1` reads docs/y.md as y.md.
+        repo = _repo_with_worktreeinclude()
+        subprocess.run(["git", "-C", repo, "config", "diff.noprefix", "true"], check=True, capture_output=True)
+
+        def stage(wt):
+            _write(wt, "docs/y.md", "STAGED DOC\n")
+            subprocess.run(["git", "-C", wt, "add", "-f", "docs/y.md"], check=True, capture_output=True)
+
+        r = self._run(repo, self._writing(stage))
+        patch = self._patch(r)
+        self.assertIn(b"b/" + NEW_AGENT_FILE.encode(), patch)
+        self.assertNotIn(b"STAGED DOC", patch)
+        self.assertEqual(r["blocked_copies"], ["docs/y.md"])
+
+    def test_byte_cap_counts_bytes_read_not_file_metadata(self):
+        # .env grows after any stat could see it: only a bounded read of the bytes themselves trips
+        # the cap, and no read of it may be unbounded.
+        repo = _repo_with_worktreeinclude()
+        source = os.path.normcase(os.path.realpath(os.path.join(repo, ".env")))
+        cap = oa.WORKTREEINCLUDE_MAX_FILE_BYTES
+        real_open = open
+        read_sizes = []
+
+        class Growing:
+            def __init__(self, f):
+                self._f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._f.close()
+
+            def read(self, size=-1):
+                read_sizes.append(size)
+                data = self._f.read(size)
+                return data + b"G" * ((size if size and size > 0 else cap + 1) - len(data))
+
+        def growing_open(file, mode="r", *args, **kwargs):
+            f = real_open(file, mode, *args, **kwargs)
+            if mode == "rb" and isinstance(file, str) and os.path.normcase(os.path.realpath(file)) == source:
+                return Growing(f)
+            return f
+
+        agent_calls = []
+        with mock.patch("builtins.open", growing_open):
+            r = self._run(repo, agent_calls.append)
+        self.assertEqual(agent_calls, [])
+        self.assertEqual(r["stop_reason"], "worktree_error")
+        self.assertIn("%d-byte" % cap, r["error"])
+        self.assertTrue(read_sizes)
+        self.assertTrue(all(isinstance(s, int) and 0 < s <= cap + 1 for s in read_sizes), read_sizes)
+
+    def test_copy_failure_aborts_before_the_agent_and_removes_the_worktree(self):
+        for entry in self.ENTRIES:
+            with self.subTest(entry):
+                repo = _repo_with_worktreeinclude()
+                real_write_copy = oa._write_copy
+                copy_calls = []
+                agent_calls = []
+
+                def write_failing_on_second(dst, data):
+                    copy_calls.append(dst)
+                    if len(copy_calls) == 2:
+                        raise OSError("injected copy failure")
+                    return real_write_copy(dst, data)
+
+                with mock.patch.object(oa, "_write_copy", write_failing_on_second):
+                    r = getattr(self, entry)(repo, agent_calls.append)
+                self.assertEqual(len(copy_calls), 2)
+                self.assertEqual(agent_calls, [])
+                self.assertEqual(r["stop_reason"], "worktree_error")
+                self.assertTrue(r["is_error"])
+                self.assertIn("injected copy failure", r["error"])
+                self.assertNotIn("diff_file", r)
+                self._assert_only_main_worktree(repo, os.path.dirname(copy_calls[0]))  # .env sits at the root
+
+    def test_byte_caps_abort_before_the_agent(self):
+        # .env is 9 bytes and docs/y.md 10: the first cap trips per file, the second on the sum.
+        for cap_name, cap in (("WORKTREEINCLUDE_MAX_FILE_BYTES", 8), ("WORKTREEINCLUDE_MAX_TOTAL_BYTES", 12)):
+            with self.subTest(cap_name):
+                agent_calls = []
+                with mock.patch.object(oa, cap_name, cap):
+                    r = self._run(_repo_with_worktreeinclude(), agent_calls.append)
+                self.assertEqual(agent_calls, [])
+                self.assertEqual(r["stop_reason"], "worktree_error")
+                self.assertIn("%d-byte" % cap, r["error"])
+
+    def test_incomplete_worktree_removal_is_reported(self):
+        # Each fake leaves exactly one trace of the worktree behind; the cleanup check must see it.
+        real_git = oa._git
+
+        def stale_registration(where, args):
+            shutil.rmtree(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def nonzero_exit(where, args):
+            real_git(where, *args)
+            return subprocess.CompletedProcess(args, 1, "", "error: injected")
+
+        def directory_left(where, args):
+            r = real_git(where, *args)
+            os.makedirs(args[-1])
+            return r
+
+        for fake in (stale_registration, nonzero_exit, directory_left):
+            with self.subTest(fake.__name__):
+                repo = _init_repo()
+
+                def git(where, *args, **kwargs):
+                    if args[:2] == ("worktree", "remove"):
+                        return fake(where, args)
+                    return real_git(where, *args, **kwargs)
+
+                with mock.patch.object(oa, "_git", git):
+                    r = self._run(repo, self._writing())
+                subprocess.run(["git", "-C", repo, "worktree", "prune"], capture_output=True)
+                self.assertEqual(r["stop_reason"], "done")
+                self.assertIn("not removed", r.get("cleanup_error", ""))
+
+    def test_removal_error_keeps_the_runs_report(self):
+        repo = _init_repo()
+        real_git = oa._git
+        worktrees = []
+
+        def git(where, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                raise OSError("injected removal failure")
+            return real_git(where, *args, **kwargs)
+
+        with mock.patch.object(oa, "_git", git):
+            r = self._run(repo, self._writing(worktrees.append))
+        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", worktrees[0]],
+                       check=True, capture_output=True)
+        self.assertEqual(r["stop_reason"], "done")
+        self.assertIn(NEW_AGENT_FILE, r["diff"])
+        self.assertIn("not removed", r["cleanup_error"])
+
+    def test_as_claude_copy_the_session_committed_is_stripped_by_the_final_guard(self):
+        # A commit puts the copy, and a duplicate of another copy, into the base_sha..worktree diff;
+        # only the guard removes them.
+        def commit(wt):
+            _write(wt, ".env", "SECRET=COMMITTED\n")
+            with open(os.path.join(wt, "docs", "y.md"), "rb") as f:
+                data = f.read()
+            with open(os.path.join(wt, "leak.txt"), "wb") as f:
+                f.write(data)
+            subprocess.run(["git", "-C", wt, "add", "-f", ".env", "leak.txt", NEW_AGENT_FILE],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", wt, "commit", "-q", "-m", "agent"], check=True, capture_output=True)
+
+        r = self._run_as_claude(_repo_with_worktreeinclude(), self._writing(commit))
+        patch = self._patch(r)
+        self.assertIn(NEW_AGENT_FILE.encode(), patch)
+        self.assertNotIn(b"SECRET", patch)
+        self.assertNotIn(b"local doc", patch)
+        self.assertEqual(r["copied_files"], {"count": 2, "paths": [".env", "docs/y.md"]})
+        self.assertEqual(r["modified_copies"], [".env"])
+        self.assertEqual(r["blocked_copies"], [".env", "leak.txt"])
 
 
 class ShellTest(unittest.TestCase):
