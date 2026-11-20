@@ -388,9 +388,20 @@ def _run_once(payload, model, args, _retried=False):
     return 0
 
 
+def read_stdin_utf8():
+    """Read all of stdin as UTF-8, BOM stripped, whatever the console code page is.
+
+    Exits with a one-line error when the bytes are not valid UTF-8.
+    """
+    try:
+        return sys.stdin.buffer.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        sys.exit("error: stdin must be UTF-8")
+
+
 def cmd_run(args):
     model = args.model or DEFAULT_MODEL
-    raw = args.prompt if args.prompt is not None else sys.stdin.read()
+    raw = args.prompt if args.prompt is not None else read_stdin_utf8()
     if not raw.strip():
         print("error: empty prompt (pass as an argument or via stdin).", file=sys.stderr)
         return 2

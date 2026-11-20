@@ -41,6 +41,7 @@ import urllib.error
 # reuse the read-only companion's HTTP + config (same scripts/ dir)
 from ollama_companion import (  # noqa: E402
     _post, DEFAULT_MODEL, is_cloud, _final_text, _final_source, NUM_CTX, _resolve_num_ctx,
+    read_stdin_utf8,
 )
 
 
@@ -1517,7 +1518,7 @@ def main(argv=None):
     elif args.task is not None:
         task = args.task
     else:
-        task = sys.stdin.read()
+        task = read_stdin_utf8()
     if not task.strip():
         print("error: empty task", file=sys.stderr)
         return 2
